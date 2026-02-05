@@ -8,10 +8,18 @@ from loguru import logger
 
 try:
     from kiteconnect import KiteConnect, KiteTicker
+    from kiteconnect.exceptions import TokenException, DataException
     KITE_AVAILABLE = True
 except ImportError:
     KITE_AVAILABLE = False
+    TokenException = Exception  # Fallback
+    DataException = Exception
     logger.warning("kiteconnect not installed, using mock mode")
+
+
+class TokenExpiredException(Exception):
+    """Raised when Kite access token is expired or invalid."""
+    pass
 
 
 class KiteClient:
@@ -97,7 +105,17 @@ class KiteClient:
         for attempt in range(self.max_retries):
             try:
                 return func(*args, **kwargs)
+            except TokenException as e:
+                # Token expired - don't retry, raise immediately
+                logger.error(f"Token expired or invalid: {e}")
+                raise TokenExpiredException(str(e))
             except Exception as e:
+                error_str = str(e).lower()
+                # Check for token-related errors in message
+                if "api_key" in error_str or "access_token" in error_str or "token" in error_str:
+                    logger.error(f"Token error detected: {e}")
+                    raise TokenExpiredException(str(e))
+                
                 last_error = e
                 logger.warning(f"Request failed (attempt {attempt + 1}/{self.max_retries}): {e}")
                 if attempt < self.max_retries - 1:

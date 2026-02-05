@@ -548,20 +548,72 @@ Returns live quotes for multiple indices with market status.
 ### Regime
 
 #### GET `/api/v1/regime/current`
-Returns current market regime from Sentinel service.
+Returns current market regime from Sentinel service with detailed explanation.
 
 ```json
 {
   "regime": "CHAOS",
-  "confidence": 0.80,
-  "safe_to_trade": false,
+  "confidence": 0.85,
+  "is_safe": false,
   "metrics": {
     "adx": 24.5,
     "rsi": 38.3,
-    "iv_percentile": 26
-  }
+    "iv_percentile": 78,
+    "realized_vol": 0.18,
+    "atr": 125.5
+  },
+  "thresholds": {
+    "adx_range_bound": 12,
+    "adx_trend": 22,
+    "rsi_oversold": 30,
+    "rsi_overbought": 70,
+    "rsi_neutral_low": 40,
+    "rsi_neutral_high": 60,
+    "iv_high": 75,
+    "correlation_chaos": 0.5
+  },
+  "explanation": {
+    "steps": [
+      {"step": 1, "check": "Event Calendar", "condition": "No major events within 7-day blackout", "result": "PASSED", "impact": "Continue to next check"},
+      {"step": 2, "check": "IV Percentile", "condition": "IV 78.0% > 75% threshold", "result": "TRIGGERED", "impact": "Forces CHAOS if IV too high"},
+      {"step": 3, "check": "Correlation Spike", "condition": "Max correlation 0.35 <= 0.5 threshold", "result": "PASSED", "impact": "Continue to next check"},
+      {"step": 4, "check": "ADX (Trend Strength)", "condition": "ADX 24.5 >= 12 (Range-Bound threshold)", "result": "HIGH", "impact": "Suggests Trend"},
+      {"step": 5, "check": "RSI (Momentum)", "condition": "RSI 38.3 in range [40-60] neutral, <30 oversold, >70 overbought", "result": "MODERATE", "impact": "Neutral impact"}
+    ],
+    "decision": "CHAOS triggered by: IV percentile too high: 78.0%",
+    "summary": "Regime: CHAOS with 85% confidence"
+  },
+  "safety_reasons": ["CHAOS regime detected", "IV percentile too high: 78.0%"],
+  "event_flag": false,
+  "event_name": null,
+  "correlations": {"BANKNIFTY": 0.35}
 }
 ```
+
+**Regime Classification Logic**:
+
+The Sentinel agent classifies market regime using a priority-based rule system:
+
+| Priority | Regime | Conditions |
+|----------|--------|------------|
+| 1 (Highest) | **CHAOS** | Event within 7-day blackout OR IV percentile > 75% OR Correlation spike > 0.5 |
+| 2 | **RANGE_BOUND** | ADX < 12 AND IV < 75% AND RSI between 40-60 (neutral) |
+| 3 | **MEAN_REVERSION** | ADX 12-22 AND (RSI < 30 oversold OR RSI > 70 overbought) |
+| 4 | **TREND** | ADX > 22 (strong directional momentum) |
+
+**Classification Steps (evaluated in order)**:
+
+1. **Event Calendar Check**: Major events (RBI policy, budget, FOMC) trigger 7-day blackout → CHAOS
+2. **IV Percentile Check**: IV > 75th percentile indicates high uncertainty → CHAOS  
+3. **Correlation Spike Check**: Cross-asset correlation > 0.5 signals contagion → CHAOS
+4. **ADX Analysis**: Measures trend strength (< 12 = range, 12-22 = moderate, > 22 = trend)
+5. **RSI Analysis**: Momentum indicator (< 30 oversold, 40-60 neutral, > 70 overbought)
+
+**Dashboard Display**:
+- Expandable regime card shows step-by-step classification
+- Each step shows: check name, condition evaluated, result (PASSED/TRIGGERED), impact
+- Color-coded results: green (safe), red (triggered), yellow (moderate)
+- Safety concerns listed when regime is UNSAFE
 
 ## Performance Tracking
 

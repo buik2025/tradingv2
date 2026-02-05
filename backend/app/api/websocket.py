@@ -171,12 +171,24 @@ class KiteTickerManager:
                 logger.error(f"Resubscribe error: {e}")
     
     def _on_close(self, ws, code, reason):
-        """Handle close."""
+        """Handle close - attempt reconnection."""
         logger.warning(f"Kite ticker closed: {code} - {reason}")
+        self._running = False
+        
+        # Attempt to reconnect after a short delay
+        if self._api_key and self._access_token:
+            import time
+            time.sleep(2)
+            logger.info("Attempting to reconnect Kite ticker...")
+            try:
+                self.start(self._api_key, self._access_token)
+            except Exception as e:
+                logger.error(f"Failed to reconnect ticker: {e}")
     
     def _on_error(self, ws, code, reason):
-        """Handle error."""
+        """Handle error - mark as not running so reconnect can happen."""
         logger.error(f"Kite ticker error: {code} - {reason}")
+        self._running = False
     
     def _on_reconnect(self, ws, attempts_count):
         """Handle reconnect."""
@@ -479,12 +491,18 @@ async def websocket_endpoint(websocket: WebSocket):
                 ticks = await asyncio.wait_for(tick_queue.get(), timeout=5.0)
                 if connected and ticks:
                     updated_positions = update_positions_with_ticks(positions, ticks)
+                    
+                    # Fetch strategies and portfolios with updated position data
+                    strategies, portfolios = await asyncio.get_event_loop().run_in_executor(
+                        None, fetch_strategies_and_portfolios, updated_positions
+                    )
+                    
                     await websocket.send_json({
                         "type": "price_update",
                         "data": {
                             "positions": updated_positions,
-                            "strategies": [],
-                            "portfolios": [],
+                            "strategies": strategies,
+                            "portfolios": portfolios,
                             "timestamp": datetime.now().isoformat()
                         }
                     })
@@ -535,13 +553,18 @@ async def websocket_endpoint(websocket: WebSocket):
                 tokens = [p.get("instrument_token") for p in positions if p.get("instrument_token")]
                 ticker_manager.subscribe(tokens)
         
+        # Fetch strategies and portfolios with initial position data
+        strategies, portfolios = await asyncio.get_event_loop().run_in_executor(
+            None, fetch_strategies_and_portfolios, positions
+        )
+        
         # Send initial state
         await websocket.send_json({
             "type": "initial_state",
             "data": {
                 "positions": positions,
-                "strategies": [],
-                "portfolios": [],
+                "strategies": strategies,
+                "portfolios": portfolios,
                 "timestamp": datetime.now().isoformat()
             }
         })
@@ -617,6 +640,11 @@ def fetch_positions_once() -> list:
             # Get instrument info for additional context
             inst_info = instrument_cache.get(instrument_token) or {}
             
+            # Calculate LTP change from previous close
+            close_price = p.get("close_price", 0)
+            ltp_change = last_price - close_price if close_price else 0
+            ltp_change_pct = (ltp_change / close_price * 100) if close_price else 0
+            
             result.append({
                 "id": str(instrument_token),
                 "tradingsymbol": p.get("tradingsymbol", ""),
@@ -625,6 +653,9 @@ def fetch_positions_once() -> list:
                 "quantity": qty,
                 "average_price": avg_price,
                 "last_price": last_price,
+                "close_price": close_price,
+                "ltp_change": round(ltp_change, 2),
+                "ltp_change_pct": round(ltp_change_pct, 2),
                 "pnl": pnl_data["pnl"],
                 "pnl_pct": pnl_data["pnl_pct"],
                 "lot_size": pnl_data["lot_size"],
@@ -636,6 +667,106 @@ def fetch_positions_once() -> list:
     except Exception as e:
         logger.error(f"Failed to fetch positions: {e}")
         return []
+
+
+def fetch_strategies_and_portfolios(positions: list) -> tuple:
+    """Fetch strategies and portfolios from database and enrich with live position data.
+    
+    Args:
+        positions: List of positions with live prices
+        
+    Returns:
+        Tuple of (strategies, portfolios) lists
+    """
+    from ..database.repository import Repository
+    
+    try:
+        repo = Repository()
+        
+        # Create position lookup by instrument_token
+        pos_lookup = {p.get("instrument_token"): p for p in positions}
+        
+        # Get strategies from database
+        strategies_data = repo.get_all_strategies()
+        
+        # Enrich strategies with live position data
+        enriched_strategies = []
+        for strategy in strategies_data:
+            trades = strategy.get("trades", [])
+            total_pnl = 0
+            
+            # Update trades with live prices
+            enriched_trades = []
+            for trade in trades:
+                token = trade.get("instrument_token")
+                live_pos = pos_lookup.get(token)
+                
+                if live_pos:
+                    trade_pnl = live_pos.get("pnl", 0)
+                    enriched_trades.append({
+                        **trade,
+                        "last_price": live_pos.get("last_price"),
+                        "unrealized_pnl": trade_pnl,
+                        "pnl_pct": live_pos.get("pnl_pct", 0)
+                    })
+                    total_pnl += trade_pnl
+                else:
+                    enriched_trades.append(trade)
+                    total_pnl += trade.get("unrealized_pnl", 0)
+            
+            enriched_strategies.append({
+                "id": strategy.get("id"),
+                "name": strategy.get("name"),
+                "label": strategy.get("label"),
+                "status": strategy.get("status"),
+                "unrealized_pnl": round(total_pnl, 2),
+                "realized_pnl": strategy.get("realized_pnl", 0),
+                "total_pnl": round(total_pnl + strategy.get("realized_pnl", 0), 2),
+                "position_count": len(trades),
+                "source": strategy.get("source", "MANUAL"),
+                "trades": enriched_trades
+            })
+        
+        # Get portfolios from database
+        portfolios_data = repo.get_all_portfolios()
+        
+        # Enrich portfolios with strategy data
+        enriched_portfolios = []
+        for portfolio in portfolios_data:
+            portfolio_id = portfolio.get("id")
+            portfolio_strategies = [s for s in enriched_strategies if s.get("portfolio_id") == portfolio_id]
+            
+            total_unrealized = sum(s.get("unrealized_pnl", 0) for s in portfolio_strategies)
+            total_realized = sum(s.get("realized_pnl", 0) for s in portfolio_strategies)
+            
+            enriched_portfolios.append({
+                "id": portfolio_id,
+                "name": portfolio.get("name"),
+                "unrealized_pnl": round(total_unrealized, 2),
+                "realized_pnl": round(total_realized, 2),
+                "total_pnl": round(total_unrealized + total_realized, 2),
+                "strategy_count": len(portfolio_strategies)
+            })
+        
+        # If no portfolios, create virtual "All Strategies" portfolio
+        if not enriched_portfolios and enriched_strategies:
+            total_unrealized = sum(s.get("unrealized_pnl", 0) for s in enriched_strategies)
+            total_realized = sum(s.get("realized_pnl", 0) for s in enriched_strategies)
+            
+            enriched_portfolios.append({
+                "id": "all",
+                "name": "All Strategies",
+                "unrealized_pnl": round(total_unrealized, 2),
+                "realized_pnl": round(total_realized, 2),
+                "total_pnl": round(total_unrealized + total_realized, 2),
+                "strategy_count": len(enriched_strategies)
+            })
+        
+        return enriched_strategies, enriched_portfolios
+        
+    except Exception as e:
+        logger.error(f"Failed to fetch strategies/portfolios: {e}")
+        return [], []
 
 
 def update_positions_with_ticks(positions: list, ticks: list) -> list:
@@ -656,6 +787,7 @@ def update_positions_with_ticks(positions: list, ticks: list) -> list:
         
         if tick:
             last_price = tick.get("last_price", pos.get("last_price", 0))
+            close_price = pos.get("close_price", 0)
             
             # Recalculate P&L using backend calculator
             pnl_data = PnLCalculator.calculate_position_pnl(
@@ -666,9 +798,15 @@ def update_positions_with_ticks(positions: list, ticks: list) -> list:
                 exchange=pos.get("exchange", "NFO")
             )
             
+            # Recalculate LTP change from previous close
+            ltp_change = last_price - close_price if close_price else 0
+            ltp_change_pct = (ltp_change / close_price * 100) if close_price else 0
+            
             updated.append({
                 **pos,
                 "last_price": last_price,
+                "ltp_change": round(ltp_change, 2),
+                "ltp_change_pct": round(ltp_change_pct, 2),
                 "pnl": pnl_data["pnl"],
                 "pnl_pct": pnl_data["pnl_pct"],
             })

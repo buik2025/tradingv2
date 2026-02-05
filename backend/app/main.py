@@ -9,6 +9,7 @@ import sys
 from .api.routes import router
 from .api.auth import router as auth_router
 from .api.websocket import router as ws_router
+from .api.portfolio_routes import router as portfolio_router
 from .core.logger import setup_logger
 
 
@@ -42,6 +43,7 @@ app.add_middleware(
 app.include_router(router, prefix="/api/v1")
 app.include_router(auth_router, prefix="/api/v1")
 app.include_router(ws_router, prefix="/api/v1")
+app.include_router(portfolio_router, prefix="/api/v1")
 
 
 @app.get("/")

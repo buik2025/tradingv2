@@ -34,6 +34,20 @@ export interface Order {
 
 export type RegimeType = 'RANGE_BOUND' | 'MEAN_REVERSION' | 'TREND' | 'CHAOS';
 
+export interface RegimeExplanationStep {
+  step: number;
+  check: string;
+  condition: string;
+  result: string;
+  impact: string;
+}
+
+export interface RegimeExplanation {
+  steps: RegimeExplanationStep[];
+  decision: string;
+  summary: string;
+}
+
 export interface Regime {
   regime: RegimeType;
   confidence: number;
@@ -42,7 +56,24 @@ export interface Regime {
     adx: number;
     rsi: number;
     iv_percentile: number;
+    realized_vol?: number;
+    atr?: number;
   };
+  thresholds?: {
+    adx_range_bound: number;
+    adx_trend: number;
+    rsi_oversold: number;
+    rsi_overbought: number;
+    rsi_neutral_low: number;
+    rsi_neutral_high: number;
+    iv_high: number;
+    correlation_chaos: number;
+  };
+  explanation?: RegimeExplanation;
+  safety_reasons?: string[];
+  event_flag?: boolean;
+  event_name?: string;
+  correlations?: Record<string, number>;
   timestamp: string;
 }
 

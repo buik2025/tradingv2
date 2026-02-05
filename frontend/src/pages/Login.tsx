@@ -1,10 +1,13 @@
 import { useAuthStore } from '@/stores/authStore';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
-import { TrendingUp } from 'lucide-react';
+import { TrendingUp, AlertCircle } from 'lucide-react';
+import { useSearchParams } from 'react-router-dom';
 
 export function Login() {
   const { login, isLoading, error } = useAuthStore();
+  const [searchParams] = useSearchParams();
+  const isExpired = searchParams.get('expired') === 'true';
 
   return (
     <div className="min-h-screen flex items-center justify-center bg-[var(--background)]">
@@ -21,6 +24,13 @@ export function Login() {
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-4">
+          {isExpired && (
+            <div className="p-3 rounded-lg bg-amber-500/10 border border-amber-500/20 text-amber-600 dark:text-amber-400 text-sm flex items-center gap-2">
+              <AlertCircle className="h-4 w-4 flex-shrink-0" />
+              <span>Your session has expired. Please login again.</span>
+            </div>
+          )}
+          
           {error && (
             <div className="p-3 rounded-lg bg-[var(--destructive)]/10 text-[var(--destructive)] text-sm">
               {error}

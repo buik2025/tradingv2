@@ -21,6 +21,8 @@ from ..config.thresholds import (
 )
 from ..models.regime import RegimePacket, RegimeType
 from ..models.trade import TradeProposal, TradeLeg, LegType, StructureType
+from .jade_lizard import JadeLizardStrategy
+from .butterfly import ButterflyStrategy, BrokenWingButterflyStrategy
 
 
 class Strategist(BaseAgent):
@@ -39,10 +41,21 @@ class Strategist(BaseAgent):
     def __init__(self, kite: KiteClient, config: Settings):
         super().__init__(kite, config, name="Strategist")
         self._expiry_cache: Dict[str, List[date]] = {}
+        
+        # Initialize strategy modules
+        self._jade_lizard = JadeLizardStrategy(lot_size=50)
+        self._butterfly = ButterflyStrategy(lot_size=50)
+        self._bwb = BrokenWingButterflyStrategy(lot_size=50)
     
     def process(self, regime_packet: RegimePacket) -> List[TradeProposal]:
         """
         Generate trade proposals based on regime.
+        
+        Strategy selection:
+        - RANGE_BOUND: Iron Condor, Butterfly, Jade Lizard
+        - CAUTION: Jade Lizard only (hedged structure)
+        - MEAN_REVERSION: Broken Wing Butterfly, Risk Reversal
+        - TREND/CHAOS: No new trades
         
         Args:
             regime_packet: Current regime assessment from Sentinel
@@ -57,27 +70,102 @@ class Strategist(BaseAgent):
             self.logger.debug("Outside entry window")
             return proposals
         
-        if not regime_packet.is_safe:
-            self.logger.info(f"Regime not safe: {regime_packet.safety_reasons}")
+        # CHAOS regime - no trades
+        if regime_packet.regime == RegimeType.CHAOS:
+            self.logger.info("CHAOS regime - no new trades")
             return proposals
         
-        # Generate signals based on regime
+        # CAUTION regime - only hedged structures (Jade Lizard)
+        if regime_packet.regime == RegimeType.CAUTION:
+            self.logger.info("CAUTION regime - generating hedged strategies only")
+            jl_proposal = self._generate_jade_lizard(regime_packet)
+            if jl_proposal:
+                proposals.append(jl_proposal)
+            return proposals
+        
+        # RANGE_BOUND - multiple short-vol strategies
         if regime_packet.allows_short_vol():
-            self.logger.info("Generating short-vol signals")
+            self.logger.info("RANGE_BOUND - generating short-vol signals")
+            
+            # Iron Condor (primary)
             ic_proposal = self._generate_iron_condor(regime_packet)
             if ic_proposal:
                 proposals.append(ic_proposal)
+            
+            # Butterfly (if high confidence and low BBW)
+            bf_proposal = self._generate_butterfly(regime_packet)
+            if bf_proposal:
+                proposals.append(bf_proposal)
+            
+            # Jade Lizard (if IV > 35%)
+            jl_proposal = self._generate_jade_lizard(regime_packet)
+            if jl_proposal:
+                proposals.append(jl_proposal)
         
+        # MEAN_REVERSION - directional strategies
         elif regime_packet.allows_directional():
-            self.logger.info("Generating directional signals")
-            # Directional strategies would go here
-            # fade_proposal = self._generate_intraday_fade(regime_packet)
+            self.logger.info("MEAN_REVERSION - generating directional signals")
+            
+            # Broken Wing Butterfly
+            bwb_proposal = self._generate_bwb(regime_packet)
+            if bwb_proposal:
+                proposals.append(bwb_proposal)
+        
+        # TREND - limited strategies
+        elif regime_packet.regime == RegimeType.TREND:
+            self.logger.info("TREND regime - limited strategies")
+            # Could add trend-following strategies here
             pass
         
         else:
             self.logger.debug(f"No signals for regime: {regime_packet.regime}")
         
+        # Limit to best proposal (avoid over-trading)
+        if len(proposals) > 1:
+            # Sort by risk-reward ratio
+            proposals.sort(key=lambda p: p.risk_reward_ratio, reverse=True)
+            proposals = proposals[:1]  # Keep only best
+        
         return proposals
+    
+    def _generate_jade_lizard(self, regime: RegimePacket) -> Optional[TradeProposal]:
+        """Generate Jade Lizard proposal using strategy module."""
+        symbol = regime.symbol
+        expiry = self._get_target_expiry(symbol, IC_MIN_DTE, IC_MAX_DTE)
+        if not expiry:
+            return None
+        
+        option_chain = self.kite.get_option_chain(symbol, expiry)
+        if option_chain.empty:
+            return None
+        
+        return self._jade_lizard.generate_proposal(regime, option_chain, expiry)
+    
+    def _generate_butterfly(self, regime: RegimePacket) -> Optional[TradeProposal]:
+        """Generate Iron Butterfly proposal using strategy module."""
+        symbol = regime.symbol
+        expiry = self._get_target_expiry(symbol, IC_MIN_DTE, IC_MAX_DTE)
+        if not expiry:
+            return None
+        
+        option_chain = self.kite.get_option_chain(symbol, expiry)
+        if option_chain.empty:
+            return None
+        
+        return self._butterfly.generate_proposal(regime, option_chain, expiry)
+    
+    def _generate_bwb(self, regime: RegimePacket) -> Optional[TradeProposal]:
+        """Generate Broken Wing Butterfly proposal using strategy module."""
+        symbol = regime.symbol
+        expiry = self._get_target_expiry(symbol, IC_MIN_DTE, IC_MAX_DTE)
+        if not expiry:
+            return None
+        
+        option_chain = self.kite.get_option_chain(symbol, expiry)
+        if option_chain.empty:
+            return None
+        
+        return self._bwb.generate_proposal(regime, option_chain, expiry)
     
     def _is_entry_window(self) -> bool:
         """Check if current time is within entry window."""

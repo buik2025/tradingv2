@@ -304,3 +304,161 @@ def calculate_day_range(
         Range as percentage
     """
     return (high - low) / close
+
+
+def calculate_bollinger_band_width(
+    close: pd.Series,
+    period: int = 20,
+    std_dev: float = 2.0
+) -> pd.Series:
+    """
+    Calculate Bollinger Band Width (BBW).
+    
+    BBW = (Upper Band - Lower Band) / Middle Band
+    
+    Low BBW indicates range contraction (range-bound market).
+    High BBW indicates volatility expansion.
+    
+    Args:
+        close: Close prices
+        period: SMA period (default 20)
+        std_dev: Standard deviation multiplier (default 2.0)
+        
+    Returns:
+        BBW values (ratio)
+    """
+    upper, middle, lower = calculate_bollinger_bands(close, period, std_dev)
+    bbw = (upper - lower) / middle
+    return bbw
+
+
+def calculate_bbw_percentile(
+    close: pd.Series,
+    period: int = 20,
+    lookback: int = 100
+) -> pd.Series:
+    """
+    Calculate BBW percentile relative to recent history.
+    
+    Args:
+        close: Close prices
+        period: BBW calculation period
+        lookback: Lookback for percentile calculation
+        
+    Returns:
+        BBW percentile (0-100)
+    """
+    bbw = calculate_bollinger_band_width(close, period)
+    
+    def rolling_percentile(x):
+        if len(x) < 2:
+            return 50.0
+        return (x.iloc[:-1] < x.iloc[-1]).sum() / (len(x) - 1) * 100
+    
+    return bbw.rolling(window=lookback).apply(rolling_percentile, raw=False)
+
+
+def calculate_bbw_ratio(
+    close: pd.Series,
+    period: int = 20,
+    avg_period: int = 20
+) -> pd.Series:
+    """
+    Calculate BBW ratio vs its moving average.
+    
+    Ratio < 0.5 = Range contraction (range-bound confirmation)
+    Ratio > 1.5 = Vol expansion (potential trend/chaos)
+    
+    Args:
+        close: Close prices
+        period: BBW calculation period
+        avg_period: Period for BBW average
+        
+    Returns:
+        BBW ratio (current BBW / average BBW)
+    """
+    bbw = calculate_bollinger_band_width(close, period)
+    bbw_avg = bbw.rolling(window=avg_period).mean()
+    return bbw / bbw_avg
+
+
+def calculate_volume_ratio(
+    volume: pd.Series,
+    period: int = 20
+) -> pd.Series:
+    """
+    Calculate volume ratio vs moving average.
+    
+    Ratio > 1.5 = Volume surge (potential trend)
+    Ratio < 0.8 = Low volume (range confirmation)
+    
+    Args:
+        volume: Volume series
+        period: Lookback period for average
+        
+    Returns:
+        Volume ratio
+    """
+    avg_volume = volume.rolling(window=period).mean()
+    return volume / avg_volume
+
+
+def calculate_price_position_in_range(
+    close: pd.Series,
+    high: pd.Series,
+    low: pd.Series,
+    period: int = 20
+) -> pd.Series:
+    """
+    Calculate where current price sits in recent range (0-100).
+    
+    0 = At period low
+    50 = Middle of range
+    100 = At period high
+    
+    Useful for mean-reversion signals.
+    
+    Args:
+        close: Close prices
+        high: High prices
+        low: Low prices
+        period: Lookback period
+        
+    Returns:
+        Position in range (0-100)
+    """
+    period_high = high.rolling(window=period).max()
+    period_low = low.rolling(window=period).min()
+    
+    position = (close - period_low) / (period_high - period_low) * 100
+    return position
+
+
+def calculate_atr_percentile(
+    high: pd.Series,
+    low: pd.Series,
+    close: pd.Series,
+    period: int = 14,
+    lookback: int = 252
+) -> pd.Series:
+    """
+    Calculate ATR percentile relative to historical values.
+    
+    Args:
+        high: High prices
+        low: Low prices
+        close: Close prices
+        period: ATR period
+        lookback: Lookback for percentile
+        
+    Returns:
+        ATR percentile (0-100)
+    """
+    atr = calculate_atr(high, low, close, period)
+    
+    def rolling_percentile(x):
+        if len(x) < 2:
+            return 50.0
+        return (x.iloc[:-1] < x.iloc[-1]).sum() / (len(x) - 1) * 100
+    
+    return atr.rolling(window=lookback).apply(rolling_percentile, raw=False)

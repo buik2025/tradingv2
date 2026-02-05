@@ -269,7 +269,7 @@ async def flatten_all(reason: str = "MANUAL"):
 @router.get("/positions")
 async def get_positions(request: Request):
     """Get current positions from KiteConnect (real account positions)."""
-    from ..core.kite_client import KiteClient
+    from ..core.kite_client import KiteClient, TokenExpiredException
     from ..config.settings import Settings
     from .auth import get_access_token
     
@@ -332,6 +332,9 @@ async def get_positions(request: Request):
             })
         
         return result
+    except TokenExpiredException as e:
+        logger.error(f"Token expired: {e}")
+        raise HTTPException(status_code=401, detail="Token expired. Please re-login.")
     except Exception as e:
         logger.error(f"Failed to fetch positions: {e}")
         return []
@@ -340,7 +343,7 @@ async def get_positions(request: Request):
 @router.get("/orders")
 async def get_orders(request: Request):
     """Get today's orders from KiteConnect."""
-    from ..core.kite_client import KiteClient
+    from ..core.kite_client import KiteClient, TokenExpiredException
     from ..config.settings import Settings
     from .auth import get_access_token
     
@@ -376,6 +379,9 @@ async def get_orders(request: Request):
             }
             for o in orders
         ]
+    except TokenExpiredException as e:
+        logger.error(f"Token expired: {e}")
+        raise HTTPException(status_code=401, detail="Token expired. Please re-login.")
     except Exception as e:
         logger.error(f"Failed to fetch orders: {e}")
         return []
@@ -410,7 +416,7 @@ async def get_indices_quotes(request: Request, body: IndicesQuotesRequest):
     The market_open field is determined by checking if last_trade_time is recent (within last 5 minutes).
     This avoids hardcoding market hours and works across different exchanges.
     """
-    from ..core.kite_client import KiteClient
+    from ..core.kite_client import KiteClient, TokenExpiredException
     from ..config.settings import Settings
     from .auth import get_access_token
     from datetime import datetime, timedelta
@@ -481,6 +487,9 @@ async def get_indices_quotes(request: Request, body: IndicesQuotesRequest):
         
         logger.debug(f"Returning {len(result)} quotes")
         return {"quotes": result}
+    except TokenExpiredException as e:
+        logger.error(f"Token expired: {e}")
+        raise HTTPException(status_code=401, detail="Token expired. Please re-login.")
     except Exception as e:
         logger.error(f"Failed to fetch indices: {e}")
         return {"quotes": []}
@@ -840,9 +849,9 @@ async def get_positions_with_margins(request: Request):
                 "pnl_on_margin_pct": round(pnl_on_margin_pct, 2)
             })
         
-        # Calculate margin percentage for each position
+        # Calculate margin percentage for each position (as % of total margin)
         for pos in result:
-            pos["margin_pct"] = round((pos["margin_used"] / total_used * 100) if total_used > 0 else 0, 2)
+            pos["margin_pct"] = round((pos["margin_used"] / total_margin * 100) if total_margin > 0 else 0, 2)
         
         return {
             "positions": result,
@@ -1532,6 +1541,9 @@ async def get_current_regime(request: Request):
     sentinel = Sentinel(kite, config, cache)
     regime = sentinel.process(NIFTY_TOKEN)
     
+    # Build detailed explanation of regime classification
+    explanation = _build_regime_explanation(regime)
+    
     return {
         "regime": regime.regime.value,
         "confidence": regime.regime_confidence,
@@ -1539,7 +1551,116 @@ async def get_current_regime(request: Request):
         "metrics": {
             "adx": regime.metrics.adx,
             "rsi": regime.metrics.rsi,
-            "iv_percentile": regime.metrics.iv_percentile
+            "iv_percentile": regime.metrics.iv_percentile,
+            "realized_vol": regime.metrics.realized_vol,
+            "atr": regime.metrics.atr
         },
+        "thresholds": {
+            "adx_range_bound": 12,
+            "adx_trend": 22,
+            "rsi_oversold": 30,
+            "rsi_overbought": 70,
+            "rsi_neutral_low": 40,
+            "rsi_neutral_high": 60,
+            "iv_high": 75,
+            "correlation_chaos": 0.5
+        },
+        "explanation": explanation,
+        "safety_reasons": regime.safety_reasons,
+        "event_flag": regime.event_flag,
+        "event_name": regime.event_name,
+        "correlations": regime.correlations,
         "timestamp": regime.timestamp.isoformat()
+    }
+
+
+def _build_regime_explanation(regime) -> dict:
+    """Build detailed explanation of how regime was classified."""
+    from ..config.thresholds import (
+        ADX_RANGE_BOUND, ADX_TREND,
+        RSI_OVERSOLD, RSI_OVERBOUGHT, RSI_NEUTRAL_LOW, RSI_NEUTRAL_HIGH,
+        IV_HIGH, CORRELATION_CHAOS
+    )
+    
+    steps = []
+    metrics = regime.metrics
+    
+    # Step 1: Event check
+    if regime.event_flag:
+        steps.append({
+            "step": 1,
+            "check": "Event Calendar",
+            "condition": f"Event '{regime.event_name}' within blackout period",
+            "result": "TRIGGERED",
+            "impact": "Forces CHAOS regime"
+        })
+    else:
+        steps.append({
+            "step": 1,
+            "check": "Event Calendar",
+            "condition": "No major events within 7-day blackout",
+            "result": "PASSED",
+            "impact": "Continue to next check"
+        })
+    
+    # Step 2: IV Percentile check
+    iv_status = "TRIGGERED" if metrics.iv_percentile > IV_HIGH else "PASSED"
+    steps.append({
+        "step": 2,
+        "check": "IV Percentile",
+        "condition": f"IV {metrics.iv_percentile:.1f}% {'>' if metrics.iv_percentile > IV_HIGH else '<='} {IV_HIGH}% threshold",
+        "result": iv_status,
+        "impact": "Forces CHAOS if IV too high" if iv_status == "TRIGGERED" else "Continue to next check"
+    })
+    
+    # Step 3: Correlation check
+    max_corr = max([abs(v) for v in regime.correlations.values()], default=0)
+    corr_status = "TRIGGERED" if max_corr > CORRELATION_CHAOS else "PASSED"
+    steps.append({
+        "step": 3,
+        "check": "Correlation Spike",
+        "condition": f"Max correlation {max_corr:.2f} {'>' if max_corr > CORRELATION_CHAOS else '<='} {CORRELATION_CHAOS} threshold",
+        "result": corr_status,
+        "impact": "Forces CHAOS if correlation spike" if corr_status == "TRIGGERED" else "Continue to next check"
+    })
+    
+    # Step 4: ADX check for Range-Bound
+    adx_range = metrics.adx < ADX_RANGE_BOUND
+    steps.append({
+        "step": 4,
+        "check": "ADX (Trend Strength)",
+        "condition": f"ADX {metrics.adx:.1f} {'<' if adx_range else '>='} {ADX_RANGE_BOUND} (Range-Bound threshold)",
+        "result": "LOW" if adx_range else ("HIGH" if metrics.adx > ADX_TREND else "MODERATE"),
+        "impact": "Suggests Range-Bound" if adx_range else ("Suggests Trend" if metrics.adx > ADX_TREND else "Suggests Mean-Reversion")
+    })
+    
+    # Step 5: RSI check
+    rsi_neutral = RSI_NEUTRAL_LOW <= metrics.rsi <= RSI_NEUTRAL_HIGH
+    rsi_extreme = metrics.rsi < RSI_OVERSOLD or metrics.rsi > RSI_OVERBOUGHT
+    rsi_label = "NEUTRAL" if rsi_neutral else ("OVERSOLD" if metrics.rsi < RSI_OVERSOLD else ("OVERBOUGHT" if metrics.rsi > RSI_OVERBOUGHT else "MODERATE"))
+    steps.append({
+        "step": 5,
+        "check": "RSI (Momentum)",
+        "condition": f"RSI {metrics.rsi:.1f} in range [{RSI_NEUTRAL_LOW}-{RSI_NEUTRAL_HIGH}] neutral, <{RSI_OVERSOLD} oversold, >{RSI_OVERBOUGHT} overbought",
+        "result": rsi_label,
+        "impact": "Supports Range-Bound" if rsi_neutral else ("Supports Mean-Reversion" if rsi_extreme else "Neutral impact")
+    })
+    
+    # Final decision explanation
+    regime_value = regime.regime.value
+    if regime_value == "CHAOS":
+        decision = "CHAOS triggered by: " + ", ".join(regime.safety_reasons) if regime.safety_reasons else "High uncertainty conditions"
+    elif regime_value == "RANGE_BOUND":
+        decision = f"Low ADX ({metrics.adx:.1f} < {ADX_RANGE_BOUND}) + Neutral RSI ({metrics.rsi:.1f}) + Moderate IV ({metrics.iv_percentile:.1f}%)"
+    elif regime_value == "MEAN_REVERSION":
+        decision = f"Moderate ADX ({metrics.adx:.1f}) + Extreme RSI ({metrics.rsi:.1f}) suggests reversal opportunity"
+    elif regime_value == "TREND":
+        decision = f"High ADX ({metrics.adx:.1f} > {ADX_TREND}) indicates strong directional momentum"
+    else:
+        decision = "Unable to classify with confidence"
+    
+    return {
+        "steps": steps,
+        "decision": decision,
+        "summary": f"Regime: {regime_value} with {regime.regime_confidence*100:.0f}% confidence"
     }

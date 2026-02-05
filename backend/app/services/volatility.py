@@ -288,3 +288,200 @@ def calculate_garman_klass_vol(
         vol = vol * np.sqrt(trading_days)
     
     return vol
+
+
+def calculate_rv_iv_ratio(
+    close: pd.Series,
+    current_iv: float,
+    period: int = 20
+) -> float:
+    """
+    Calculate Realized Volatility / Implied Volatility ratio.
+    
+    RV/IV < 0.8 = Vol overpriced, theta-friendly (short-vol opportunity)
+    RV/IV < 0.7 = Strong short-vol signal
+    RV/IV > 1.2 = Vol underpriced, avoid short-vol
+    
+    Args:
+        close: Close prices
+        current_iv: Current implied volatility (annualized, as decimal e.g., 0.15 for 15%)
+        period: Period for RV calculation
+        
+    Returns:
+        RV/IV ratio
+    """
+    rv = calculate_realized_vol(close, period, annualize=True)
+    current_rv = rv.iloc[-1] if not rv.empty else 0
+    
+    if current_iv == 0:
+        return 1.0
+    
+    return current_rv / current_iv
+
+
+def calculate_rv_iv_ratio_series(
+    close: pd.Series,
+    iv_series: pd.Series,
+    period: int = 20
+) -> pd.Series:
+    """
+    Calculate RV/IV ratio as a time series.
+    
+    Args:
+        close: Close prices
+        iv_series: Implied volatility series (annualized)
+        period: Period for RV calculation
+        
+    Returns:
+        RV/IV ratio series
+    """
+    rv = calculate_realized_vol(close, period, annualize=True)
+    
+    # Align indices
+    aligned_rv, aligned_iv = rv.align(iv_series, join='inner')
+    
+    # Avoid division by zero
+    ratio = aligned_rv / aligned_iv.replace(0, np.nan)
+    
+    return ratio
+
+
+def calculate_intraday_rv(
+    high: pd.Series,
+    low: pd.Series,
+    close: pd.Series,
+    period: int = 14
+) -> float:
+    """
+    Calculate intraday realized volatility using ATR.
+    
+    Useful for comparing against IV to detect theta-friendly conditions.
+    
+    Args:
+        high: High prices (intraday bars)
+        low: Low prices (intraday bars)
+        close: Close prices (intraday bars)
+        period: ATR period
+        
+    Returns:
+        Intraday RV as annualized percentage
+    """
+    from .technical import calculate_atr
+    
+    atr = calculate_atr(high, low, close, period)
+    current_atr = atr.iloc[-1] if not atr.empty else 0
+    current_close = close.iloc[-1] if not close.empty else 1
+    
+    # Convert ATR to percentage
+    atr_pct = current_atr / current_close
+    
+    # Annualize (assuming 5-min bars, ~75 bars per day, 252 trading days)
+    # For daily bars, use sqrt(252)
+    annualized = atr_pct * np.sqrt(252)
+    
+    return annualized
+
+
+def detect_correlation_spike_dynamic(
+    correlations: pd.Series,
+    lookback: int = 20,
+    std_threshold: float = 1.0
+) -> Tuple[bool, float]:
+    """
+    Detect correlation spike relative to historical average.
+    
+    More sophisticated than absolute threshold - triggers only on
+    sudden spikes above historical norm.
+    
+    Args:
+        correlations: Rolling correlation series
+        lookback: Lookback for historical average
+        std_threshold: Number of std devs above mean to trigger
+        
+    Returns:
+        Tuple of (spike_detected, current_z_score)
+    """
+    if len(correlations) < lookback:
+        return False, 0.0
+    
+    recent = correlations.tail(lookback)
+    current = correlations.iloc[-1]
+    
+    mean_corr = recent.mean()
+    std_corr = recent.std()
+    
+    if std_corr == 0:
+        return False, 0.0
+    
+    z_score = (abs(current) - abs(mean_corr)) / std_corr
+    
+    spike_detected = z_score > std_threshold
+    
+    return spike_detected, z_score
+
+
+def calculate_vol_regime_score(
+    iv_percentile: float,
+    rv_iv_ratio: float,
+    bbw_ratio: float,
+    volume_ratio: float
+) -> Tuple[str, float]:
+    """
+    Calculate comprehensive volatility regime score.
+    
+    Combines multiple vol metrics into a single regime assessment.
+    
+    Args:
+        iv_percentile: IV percentile (0-100)
+        rv_iv_ratio: RV/IV ratio
+        bbw_ratio: BBW ratio vs average
+        volume_ratio: Volume ratio vs average
+        
+    Returns:
+        Tuple of (regime_label, confidence)
+    """
+    score = 0.0
+    
+    # IV percentile contribution (low IV = range-bound)
+    if iv_percentile < 25:
+        score += 2.0  # Strong range signal
+    elif iv_percentile < 35:
+        score += 1.0  # Moderate range signal
+    elif iv_percentile > 75:
+        score -= 2.0  # Chaos signal
+    elif iv_percentile > 50:
+        score -= 0.5  # Mild trend signal
+    
+    # RV/IV ratio contribution (low = theta-friendly)
+    if rv_iv_ratio < 0.7:
+        score += 1.5  # Strong theta opportunity
+    elif rv_iv_ratio < 0.8:
+        score += 1.0  # Theta-friendly
+    elif rv_iv_ratio > 1.2:
+        score -= 1.5  # Vol underpriced
+    
+    # BBW ratio contribution (low = range contraction)
+    if bbw_ratio < 0.5:
+        score += 1.5  # Strong range contraction
+    elif bbw_ratio < 0.8:
+        score += 0.5  # Mild contraction
+    elif bbw_ratio > 1.5:
+        score -= 1.5  # Vol expansion
+    
+    # Volume ratio contribution (low = no trend fuel)
+    if volume_ratio < 0.8:
+        score += 0.5  # Low participation
+    elif volume_ratio > 1.5:
+        score -= 1.0  # Volume surge
+    
+    # Determine regime
+    if score >= 3.0:
+        return "RANGE_BOUND", min(0.95, 0.5 + score * 0.1)
+    elif score >= 1.0:
+        return "MEAN_REVERSION", min(0.85, 0.5 + score * 0.1)
+    elif score <= -3.0:
+        return "CHAOS", min(0.95, 0.5 + abs(score) * 0.1)
+    elif score <= -1.0:
+        return "TREND", min(0.85, 0.5 + abs(score) * 0.1)
+    else:
+        return "UNCERTAIN", 0.5

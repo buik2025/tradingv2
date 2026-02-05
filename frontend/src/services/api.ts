@@ -6,6 +6,33 @@ const api = axios.create({
   withCredentials: true,
 });
 
+// Response interceptor to handle token expiry (401)
+api.interceptors.response.use(
+  (response) => response,
+  (error) => {
+    const requestUrl = error.config?.url || '';
+    const isAuthEndpoint = requestUrl.includes('/auth/');
+    
+    // Only redirect on 401 if:
+    // 1. It's NOT an auth endpoint (auth/me returns 401 for unauthenticated users - that's normal)
+    // 2. We're not already on login page
+    if (error.response?.status === 401 && !isAuthEndpoint) {
+      console.warn('Token expired, redirecting to login...');
+      
+      // Clear any stored auth state
+      localStorage.removeItem('kite_access_token');
+      sessionStorage.removeItem('kite_access_token');
+      
+      // Redirect to login page
+      const currentPath = window.location.pathname;
+      if (currentPath !== '/login' && currentPath !== '/auth/callback') {
+        window.location.href = '/login?expired=true';
+      }
+    }
+    return Promise.reject(error);
+  }
+);
+
 // Auth
 export const authApi = {
   getLoginUrl: () => api.get<{ url: string }>('/auth/login-url'),

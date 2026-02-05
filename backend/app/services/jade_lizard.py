@@ -34,25 +34,33 @@ class JadeLizardStrategy:
         self.name = "JADE_LIZARD"
     
     def check_entry_conditions(self, regime: RegimePacket) -> Tuple[bool, str]:
-        """Check if entry conditions are met."""
-        # Regime check
-        if regime.regime not in [RegimeType.RANGE_BOUND, RegimeType.MEAN_REVERSION]:
+        """
+        Check if entry conditions are met.
+        
+        Jade Lizard is ideal for CAUTION regime (hedged structure).
+        Also works in RANGE_BOUND and MEAN_REVERSION.
+        """
+        # Regime check - Jade Lizard works in CAUTION (it's hedged)
+        allowed_regimes = [RegimeType.RANGE_BOUND, RegimeType.MEAN_REVERSION, RegimeType.CAUTION]
+        if regime.regime not in allowed_regimes:
             return False, f"Regime not suitable: {regime.regime.value}"
         
-        # Safety check
-        if not regime.is_safe:
+        # For CAUTION regime, we allow entry (it's a hedged structure)
+        # For other regimes, check safety
+        if regime.regime != RegimeType.CAUTION and not regime.is_safe:
             return False, f"Regime not safe: {regime.safety_reasons}"
         
-        # IV check (need higher IV for jade lizard)
-        if regime.metrics.iv_percentile < 50:
-            return False, f"IV too low: {regime.metrics.iv_percentile:.1f}% < 50%"
+        # IV check - need moderate IV for jade lizard (lowered from 50 to 35)
+        if regime.metrics.iv_percentile < 35:
+            return False, f"IV too low: {regime.metrics.iv_percentile:.1f}% < 35%"
         
         # Event check
         if regime.event_flag:
             return False, f"Event blackout: {regime.event_name}"
         
-        # RSI check for bullish bias
-        if regime.metrics.rsi < 40:
+        # RSI check for bullish/neutral bias (relaxed for CAUTION)
+        min_rsi = 35 if regime.regime == RegimeType.CAUTION else 40
+        if regime.metrics.rsi < min_rsi:
             return False, f"RSI too bearish: {regime.metrics.rsi:.1f}"
         
         return True, "All conditions met"

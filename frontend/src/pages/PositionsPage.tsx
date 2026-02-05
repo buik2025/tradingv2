@@ -1,20 +1,28 @@
-import { useEffect, useState, useMemo, useCallback } from 'react';
+/**
+ * Positions Page - Display only, all data comes from backend.
+ */
+
+import { useState, useMemo, useEffect, useCallback } from 'react';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { formatCurrency, formatPercent } from '@/lib/utils';
 import { ArrowUpDown, ArrowUp, ArrowDown, Search, X, Plus, RefreshCw, Wifi, WifiOff } from 'lucide-react';
-import { positionsApi, strategiesApi, type PositionWithMargin } from '@/services/api';
+import { strategiesApi } from '@/services/api';
+import { portfolioApi, type Position, type PositionsResponse } from '@/services/portfolioApi';
 import { useWebSocket } from '@/hooks/useWebSocket';
-import { AccountSummary } from '@/components/AccountSummary';
 
-type SortField = 'tradingsymbol' | 'exchange' | 'quantity' | 'average_price' | 'last_price' | 'pnl' | 'pnl_pct' | 'margin_used' | 'margin_pct' | 'pnl_on_margin_pct';
+type SortField = keyof Position;
 type SortDirection = 'asc' | 'desc';
 
 export function PositionsPage() {
-  const wsState = useWebSocket();
+  const { connected, positions: wsPositions } = useWebSocket();
   
-  const [positions, setPositions] = useState<PositionWithMargin[]>([]);
+  // All data comes from backend - no frontend calculations
+  const [data, setData] = useState<PositionsResponse | null>(null);
+  const [isLoading, setIsLoading] = useState(true);
+  const [isRefreshing, setIsRefreshing] = useState(false);
+  
   const [sortField, setSortField] = useState<SortField>('pnl');
   const [sortDirection, setSortDirection] = useState<SortDirection>('desc');
   const [searchTerm, setSearchTerm] = useState('');
@@ -23,52 +31,63 @@ export function PositionsPage() {
   const [showCreateStrategy, setShowCreateStrategy] = useState(false);
   const [newStrategyName, setNewStrategyName] = useState('');
   const [creatingStrategy, setCreatingStrategy] = useState(false);
-  const [isRefreshing, setIsRefreshing] = useState(false);
-  const [refreshTrigger, setRefreshTrigger] = useState(0);
 
-  const fetchPositions = useCallback(async () => {
+  const fetchData = useCallback(async () => {
     setIsRefreshing(true);
     try {
-      const response = await positionsApi.getWithMargins();
-      setPositions(response.data.positions || []);
+      const response = await portfolioApi.getPositions();
+      setData(response.data);
     } catch (error) {
       console.error('Failed to fetch positions:', error);
     } finally {
+      setIsLoading(false);
       setIsRefreshing(false);
     }
   }, []);
 
   useEffect(() => {
-    fetchPositions();
-  }, [fetchPositions]);
+    fetchData();
+  }, [fetchData]);
 
-  // Update positions with WebSocket data for real-time P&L
-  const positionsWithLiveData = useMemo(() => {
-    if (!wsState.connected || wsState.positions.length === 0) {
-      return positions;
-    }
+  // Merge WebSocket updates with initial data for real-time prices
+  const positions = useMemo(() => {
+    const basePositions = data?.positions || [];
+    if (!wsPositions.length) return basePositions;
     
-    const positionsByToken: Record<number, typeof wsState.positions[0]> = {};
-    for (const pos of wsState.positions) {
-      positionsByToken[pos.instrument_token] = pos;
-    }
+    // Create lookup from WebSocket data
+    const wsLookup = new Map(wsPositions.map(p => [p.instrument_token, p]));
     
-    return positions.map(pos => {
-      const livePos = positionsByToken[pos.instrument_token];
-      if (livePos) {
-        const pnl = livePos.pnl;
-        const pnlOnMarginPct = pos.margin_used > 0 ? (pnl / pos.margin_used * 100) : 0;
+    // Merge: use WebSocket prices if available
+    return basePositions.map(pos => {
+      const wsPos = wsLookup.get(pos.instrument_token);
+      if (wsPos && wsPos.last_price) {
         return {
           ...pos,
-          last_price: livePos.last_price || pos.last_price,
-          pnl: pnl,
-          pnl_pct: livePos.pnl_pct || pos.pnl_pct,
-          pnl_on_margin_pct: pnlOnMarginPct
+          last_price: wsPos.last_price,
+          ltp_change: wsPos.ltp_change ?? pos.ltp_change,
+          ltp_change_pct: wsPos.ltp_change_pct ?? pos.ltp_change_pct,
+          pnl: wsPos.pnl,
+          pnl_pct: wsPos.pnl_pct || pos.pnl_pct,
         };
       }
       return pos;
     });
-  }, [positions, wsState.connected, wsState.positions]);
+  }, [data?.positions, wsPositions]);
+  
+  const account = data?.account;
+  
+  // Recalculate totals when positions update from WebSocket
+  const totals = useMemo(() => {
+    if (!positions.length) return data?.totals;
+    const totalPnl = positions.reduce((sum, p) => sum + p.pnl, 0);
+    const totalMargin = positions.reduce((sum, p) => sum + p.margin_used, 0);
+    return {
+      pnl: totalPnl,
+      margin: totalMargin,
+      pnl_on_margin_pct: totalMargin > 0 ? (totalPnl / totalMargin * 100) : 0,
+      count: positions.length
+    };
+  }, [positions, data?.totals]);
 
   const handleSort = (field: SortField) => {
     if (sortField === field) {
@@ -87,11 +106,12 @@ export function PositionsPage() {
   };
 
   const uniqueExchanges = useMemo(() => 
-    [...new Set(positionsWithLiveData.map(p => p.exchange))], [positionsWithLiveData]
+    [...new Set(positions.map(p => p.exchange))], [positions]
   );
 
+  // Only filtering and sorting in frontend - no calculations
   const filteredAndSortedPositions = useMemo(() => {
-    let result = [...positionsWithLiveData];
+    let result = [...positions];
 
     if (searchTerm) {
       result = result.filter(p => 
@@ -115,17 +135,7 @@ export function PositionsPage() {
     });
 
     return result;
-  }, [positionsWithLiveData, searchTerm, filterExchange, sortField, sortDirection]);
-
-  const totalPnl = useMemo(() => 
-    filteredAndSortedPositions.reduce((sum, p) => sum + p.pnl, 0),
-    [filteredAndSortedPositions]
-  );
-
-  const totalMarginUsed = useMemo(() => 
-    filteredAndSortedPositions.reduce((sum, p) => sum + p.margin_used, 0),
-    [filteredAndSortedPositions]
-  );
+  }, [positions, searchTerm, filterExchange, sortField, sortDirection]);
 
   const togglePositionSelection = (id: string) => {
     setSelectedPositions(prev => {
@@ -148,7 +158,6 @@ export function PositionsPage() {
         name: newStrategyName,
         position_ids: Array.from(selectedPositions),
       });
-      
       setSelectedPositions(new Set());
       setShowCreateStrategy(false);
       setNewStrategyName('');
@@ -159,10 +168,9 @@ export function PositionsPage() {
     }
   };
 
-  const generateDefaultStrategyName = () => {
-    const date = new Date();
-    return `Strategy ${date.toLocaleDateString('en-IN', { day: 'numeric', month: 'short' })}`;
-  };
+  if (isLoading) {
+    return <div className="text-center py-8 text-[var(--muted-foreground)]">Loading positions...</div>;
+  }
 
   return (
     <div className="space-y-6">
@@ -172,7 +180,7 @@ export function PositionsPage() {
           <p className="text-[var(--muted-foreground)]">Manage your open positions with margin tracking</p>
         </div>
         <div className="flex items-center gap-2">
-          {wsState.connected ? (
+          {connected ? (
             <Badge variant="outline" className="text-[var(--profit)] border-[var(--profit)]">
               <Wifi className="h-3 w-3 mr-1" /> Live
             </Badge>
@@ -184,14 +192,35 @@ export function PositionsPage() {
         </div>
       </div>
 
-      <AccountSummary refreshTrigger={refreshTrigger} />
+      {/* Account Summary - data from backend */}
+      {account && (
+        <div className="grid grid-cols-4 gap-4">
+          <Card><CardContent className="pt-4">
+            <p className="text-xs text-[var(--muted-foreground)]">Total Margin</p>
+            <p className="text-xl font-bold">{formatCurrency(account.total_margin)}</p>
+          </CardContent></Card>
+          <Card><CardContent className="pt-4">
+            <p className="text-xs text-[var(--muted-foreground)]">Used Margin</p>
+            <p className="text-xl font-bold">{formatCurrency(account.used_margin)}</p>
+            <p className="text-xs text-[var(--muted-foreground)]">{formatPercent(account.margin_utilization_pct)} utilized</p>
+          </CardContent></Card>
+          <Card><CardContent className="pt-4">
+            <p className="text-xs text-[var(--muted-foreground)]">Available Margin</p>
+            <p className="text-xl font-bold text-[var(--profit)]">{formatCurrency(account.available_margin)}</p>
+            <p className="text-xs text-[var(--muted-foreground)]">{formatPercent(account.available_margin_pct)} available</p>
+          </CardContent></Card>
+          <Card><CardContent className="pt-4">
+            <p className="text-xs text-[var(--muted-foreground)]">Cash Available</p>
+            <p className="text-xl font-bold">{formatCurrency(account.cash_available)}</p>
+            <p className="text-xs text-[var(--muted-foreground)]">+{formatCurrency(account.collateral)} collateral</p>
+          </CardContent></Card>
+        </div>
+      )}
 
       <Card>
         <CardHeader>
           <div className="flex items-center justify-between">
-            <CardTitle className="flex items-center gap-2">
-              Open Positions ({filteredAndSortedPositions.length})
-            </CardTitle>
+            <CardTitle>Open Positions ({filteredAndSortedPositions.length})</CardTitle>
             <div className="flex items-center gap-4">
               <div className="relative">
                 <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 h-4 w-4 text-[var(--muted-foreground)]" />
@@ -203,10 +232,7 @@ export function PositionsPage() {
                   className="pl-9 pr-8 py-2 text-sm bg-[var(--background)] border border-[var(--border)] rounded-md w-48 focus:outline-none focus:ring-1 focus:ring-[var(--primary)]"
                 />
                 {searchTerm && (
-                  <button
-                    onClick={() => setSearchTerm('')}
-                    className="absolute right-2 top-1/2 transform -translate-y-1/2"
-                  >
+                  <button onClick={() => setSearchTerm('')} className="absolute right-2 top-1/2 transform -translate-y-1/2">
                     <X className="h-4 w-4 text-[var(--muted-foreground)]" />
                   </button>
                 )}
@@ -217,11 +243,9 @@ export function PositionsPage() {
                 className="px-3 py-2 text-sm bg-[var(--background)] border border-[var(--border)] rounded-md focus:outline-none"
               >
                 <option value="all">All Exchanges</option>
-                {uniqueExchanges.map(ex => (
-                  <option key={ex} value={ex}>{ex}</option>
-                ))}
+                {uniqueExchanges.map(ex => <option key={ex} value={ex}>{ex}</option>)}
               </select>
-              <Button variant="outline" size="sm" onClick={() => { fetchPositions(); setRefreshTrigger(t => t + 1); }} disabled={isRefreshing}>
+              <Button variant="outline" size="sm" onClick={fetchData} disabled={isRefreshing}>
                 <RefreshCw className={`h-4 w-4 mr-1 ${isRefreshing ? 'animate-spin' : ''}`} />
                 Refresh
               </Button>
@@ -296,7 +320,12 @@ export function PositionsPage() {
                     </td>
                     <td className="py-3 px-4 text-right">{position.quantity}</td>
                     <td className="py-3 px-4 text-right">{formatCurrency(position.average_price)}</td>
-                    <td className="py-3 px-4 text-right">{formatCurrency(position.last_price)}</td>
+                    <td className="py-3 px-4 text-right">
+                      <div>{formatCurrency(position.last_price)}</div>
+                      <div className={`text-xs ${(position.ltp_change_pct || 0) >= 0 ? 'text-[var(--profit)]' : 'text-[var(--loss)]'}`}>
+                        {(position.ltp_change_pct || 0) >= 0 ? '+' : ''}{formatPercent(position.ltp_change_pct || 0)}
+                      </div>
+                    </td>
                     <td className={`py-3 px-4 text-right font-medium ${position.pnl >= 0 ? 'text-[var(--profit)]' : 'text-[var(--loss)]'}`}>
                       {formatCurrency(position.pnl)}
                     </td>
@@ -316,6 +345,7 @@ export function PositionsPage() {
             </table>
           </div>
 
+          {/* Footer with totals from backend */}
           <div className="mt-4 pt-4 border-t border-[var(--border)] flex justify-between items-center">
             <div className="flex items-center gap-4">
               <span className="text-sm text-[var(--muted-foreground)]">
@@ -325,7 +355,8 @@ export function PositionsPage() {
                 <Button 
                   size="sm" 
                   onClick={() => {
-                    setNewStrategyName(generateDefaultStrategyName());
+                    const date = new Date();
+                    setNewStrategyName(`Strategy ${date.toLocaleDateString('en-IN', { day: 'numeric', month: 'short' })}`);
                     setShowCreateStrategy(true);
                   }}
                   className="gap-1"
@@ -335,18 +366,20 @@ export function PositionsPage() {
                 </Button>
               )}
             </div>
-            <div className="flex items-center gap-6">
-              <div className="text-right">
-                <span className="text-sm text-[var(--muted-foreground)]">Total Margin: </span>
-                <span className="font-bold">{formatCurrency(totalMarginUsed)}</span>
+            {totals && (
+              <div className="flex items-center gap-6">
+                <div className="text-right">
+                  <span className="text-sm text-[var(--muted-foreground)]">Total Margin: </span>
+                  <span className="font-bold">{formatCurrency(totals.margin)}</span>
+                </div>
+                <div className="text-right">
+                  <span className="text-sm text-[var(--muted-foreground)]">Total P&L: </span>
+                  <span className={`font-bold ${totals.pnl >= 0 ? 'text-[var(--profit)]' : 'text-[var(--loss)]'}`}>
+                    {formatCurrency(totals.pnl)}
+                  </span>
+                </div>
               </div>
-              <div className="text-right">
-                <span className="text-sm text-[var(--muted-foreground)]">Total P&L: </span>
-                <span className={`font-bold ${totalPnl >= 0 ? 'text-[var(--profit)]' : 'text-[var(--loss)]'}`}>
-                  {formatCurrency(totalPnl)}
-                </span>
-              </div>
-            </div>
+            )}
           </div>
         </CardContent>
       </Card>

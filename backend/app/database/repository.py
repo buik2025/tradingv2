@@ -9,7 +9,8 @@ from loguru import logger
 
 from .models import (
     Base, TradeRecord, PositionRecord, RegimeLog, EventRecord, DailyStats,
-    Strategy, StrategyLeg, StrategyPerformance, DATABASE_URL
+    Strategy, StrategyLeg, StrategyPerformance, StrategyTrade, Portfolio, 
+    BrokerPosition, StrategyPosition, DATABASE_URL
 )
 
 
@@ -385,3 +386,153 @@ class Repository:
             if strategy_type:
                 query = query.filter(StrategyPerformance.strategy_type == strategy_type)
             return query.order_by(StrategyPerformance.date).all()
+    
+    # ============== Portfolio Operations ==============
+    
+    def get_all_portfolios(self) -> List[Dict[str, Any]]:
+        """Get all portfolios as dictionaries for API response."""
+        with self._get_session() as session:
+            portfolios = session.query(Portfolio).filter(
+                Portfolio.is_active == True
+            ).order_by(desc(Portfolio.created_at)).all()
+            
+            return [
+                {
+                    "id": p.id,
+                    "name": p.name,
+                    "description": p.description,
+                    "realized_pnl": float(p.realized_pnl or 0),
+                    "unrealized_pnl": float(p.unrealized_pnl or 0),
+                    "total_margin": float(p.total_margin or 0),
+                    "is_active": p.is_active,
+                    "created_at": p.created_at.isoformat() if p.created_at else None,
+                }
+                for p in portfolios
+            ]
+    
+    def save_portfolio(self, portfolio: Portfolio) -> str:
+        """Save a portfolio and return its ID."""
+        with self._get_session() as session:
+            session.merge(portfolio)
+            session.commit()
+            logger.info(f"Saved portfolio: {portfolio.id} - {portfolio.name}")
+            return portfolio.id
+    
+    def get_portfolio(self, portfolio_id: str) -> Optional[Portfolio]:
+        """Get a portfolio by ID."""
+        with self._get_session() as session:
+            return session.query(Portfolio).filter_by(id=portfolio_id).first()
+    
+    # ============== Strategy Operations (Extended) ==============
+    
+    def get_all_strategies(self) -> List[Dict[str, Any]]:
+        """Get all strategies with their trades as dictionaries for API response."""
+        with self._get_session() as session:
+            strategies = session.query(Strategy).filter(
+                Strategy.status == "OPEN"
+            ).order_by(desc(Strategy.created_at)).all()
+            
+            result = []
+            for s in strategies:
+                # Get trades for this strategy
+                trades = session.query(StrategyTrade).filter(
+                    StrategyTrade.strategy_id == s.id,
+                    StrategyTrade.status == "OPEN"
+                ).all()
+                
+                result.append({
+                    "id": s.id,
+                    "portfolio_id": s.portfolio_id,
+                    "name": s.name,
+                    "description": s.description,
+                    "label": s.label,
+                    "status": s.status,
+                    "source": s.source,
+                    "realized_pnl": float(s.realized_pnl or 0),
+                    "unrealized_pnl": float(s.unrealized_pnl or 0),
+                    "notes": s.notes,
+                    "tags": s.tags,
+                    "created_at": s.created_at.isoformat() if s.created_at else None,
+                    "trades": [
+                        {
+                            "id": t.id,
+                            "tradingsymbol": t.tradingsymbol,
+                            "instrument_token": t.instrument_token,
+                            "exchange": t.exchange,
+                            "instrument_type": t.instrument_type,
+                            "quantity": t.quantity,
+                            "entry_price": float(t.entry_price or 0),
+                            "last_price": float(t.last_price) if t.last_price else None,
+                            "unrealized_pnl": float(t.unrealized_pnl or 0),
+                            "realized_pnl": float(t.realized_pnl or 0),
+                            "pnl_pct": float(t.pnl_pct or 0),
+                            "status": t.status,
+                            "entry_time": t.entry_time.isoformat() if t.entry_time else None,
+                        }
+                        for t in trades
+                    ]
+                })
+            
+            return result
+    
+    def create_strategy_with_trades(
+        self,
+        name: str,
+        trades_data: List[Dict[str, Any]],
+        portfolio_id: Optional[str] = None,
+        label: Optional[str] = None,
+        notes: Optional[str] = None,
+        tags: Optional[List[str]] = None
+    ) -> str:
+        """Create a new strategy with trades from position data."""
+        import uuid
+        
+        with self._get_session() as session:
+            # Create strategy
+            strategy = Strategy(
+                id=str(uuid.uuid4()),
+                portfolio_id=portfolio_id,
+                name=name,
+                label=label,
+                status="OPEN",
+                source="MANUAL",
+                notes=notes,
+                tags=tags,
+                created_at=datetime.now()
+            )
+            session.add(strategy)
+            
+            # Create trades
+            for trade_data in trades_data:
+                trade = StrategyTrade(
+                    id=str(uuid.uuid4()),
+                    strategy_id=strategy.id,
+                    tradingsymbol=trade_data.get("tradingsymbol", ""),
+                    instrument_token=trade_data.get("instrument_token", 0),
+                    exchange=trade_data.get("exchange", "NFO"),
+                    instrument_type=trade_data.get("instrument_type"),
+                    lot_size=trade_data.get("lot_size", 1),
+                    quantity=trade_data.get("quantity", 0),
+                    entry_price=trade_data.get("average_price", 0),
+                    last_price=trade_data.get("last_price"),
+                    unrealized_pnl=trade_data.get("pnl", 0),
+                    status="OPEN",
+                    source="LIVE",
+                    entry_time=datetime.now()
+                )
+                session.add(trade)
+            
+            session.commit()
+            logger.info(f"Created strategy: {strategy.id} - {name} with {len(trades_data)} trades")
+            return strategy.id
+    
+    def delete_strategy(self, strategy_id: str) -> bool:
+        """Delete a strategy and its trades."""
+        with self._get_session() as session:
+            strategy = session.query(Strategy).filter_by(id=strategy_id).first()
+            if strategy:
+                session.delete(strategy)
+                session.commit()
+                logger.info(f"Deleted strategy: {strategy_id}")
+                return True
+            return False

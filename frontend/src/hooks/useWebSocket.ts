@@ -17,6 +17,9 @@ export interface PositionUpdate {
   quantity: number;
   average_price: number;
   last_price: number | null;
+  close_price?: number;
+  ltp_change?: number;
+  ltp_change_pct?: number;
   pnl: number;
   pnl_pct?: number;
   source: string;

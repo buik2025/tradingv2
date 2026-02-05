@@ -15,17 +15,25 @@ from ..config.constants import (
     INTERVAL_5MIN, INTERVAL_DAY, REGIME_LOOKBACK_DAYS
 )
 from ..config.thresholds import (
-    ADX_RANGE_BOUND, ADX_TREND,
+    ADX_RANGE_BOUND, ADX_MEAN_REVERSION, ADX_TREND, ADX_CHAOS,
     RSI_OVERSOLD, RSI_OVERBOUGHT, RSI_NEUTRAL_LOW, RSI_NEUTRAL_HIGH,
-    IV_LOW, IV_HIGH, IV_ENTRY_MIN,
-    CORRELATION_THRESHOLD, CORRELATION_CHAOS,
-    ML_OVERRIDE_PROBABILITY, EVENT_BLACKOUT_DAYS
+    IV_LOW, IV_HIGH, IV_ENTRY_MIN, IV_LOW_VOL_BONUS,
+    CORRELATION_THRESHOLD, CORRELATION_CHAOS, CORRELATION_INTRA_EQUITY,
+    ML_OVERRIDE_PROBABILITY, ML_CHAOS_PROBABILITY, EVENT_BLACKOUT_DAYS,
+    MIN_CHAOS_TRIGGERS, MIN_CAUTION_TRIGGERS,
+    BBW_RANGE_BOUND, BBW_EXPANSION,
+    RV_IV_THETA_FRIENDLY, RV_IV_STRONG_THETA,
+    VOLUME_SURGE, VOLUME_LOW
 )
-from ..models.regime import RegimeType, RegimePacket, RegimeMetrics
-from .technical import calculate_adx, calculate_rsi, calculate_atr, calculate_day_range
+from ..models.regime import RegimeType, RegimePacket, RegimeMetrics, ConfluenceScore
+from .technical import (
+    calculate_adx, calculate_rsi, calculate_atr, calculate_day_range,
+    calculate_bollinger_band_width, calculate_bbw_ratio, calculate_volume_ratio
+)
 from .volatility import (
     calculate_iv_percentile, calculate_realized_vol, 
-    calculate_correlation, detect_correlation_spike
+    calculate_correlation, detect_correlation_spike,
+    calculate_rv_iv_ratio, detect_correlation_spike_dynamic
 )
 
 
@@ -101,23 +109,27 @@ class Sentinel(BaseAgent):
         correlations = self._calculate_correlations(instrument_token)
         correlation_alert = any(abs(v) > CORRELATION_THRESHOLD for v in correlations.values())
         
-        # 6. Classify regime
-        regime, confidence = self._classify_regime(metrics, event_flag, correlations)
+        # 6. Classify regime with confluence scoring
+        regime, confidence, confluence = self._classify_regime(metrics, event_flag, correlations)
         
-        # 7. ML override (if available)
+        # 7. ML override (if available) - require higher prob for CHAOS
         ml_regime, ml_probability = self._ml_classify(metrics) if self.ml_classifier else (None, 0.0)
         if ml_regime and ml_probability > ML_OVERRIDE_PROBABILITY:
-            self.logger.info(f"ML override: {ml_regime} (prob={ml_probability:.2f})")
-            regime = ml_regime
-            confidence = ml_probability
+            # For CHAOS, require higher probability to prevent false positives
+            if ml_regime == RegimeType.CHAOS and ml_probability < ML_CHAOS_PROBABILITY:
+                self.logger.info(f"ML CHAOS below threshold: {ml_probability:.2f} < {ML_CHAOS_PROBABILITY}")
+            else:
+                self.logger.info(f"ML override: {ml_regime} (prob={ml_probability:.2f})")
+                regime = ml_regime
+                confidence = ml_probability
         
         # 8. Determine approved universe
         approved_universe, disabled = self._get_approved_universe(correlations)
         
-        # 9. Safety check
-        is_safe, safety_reasons = self._safety_check(regime, metrics, event_flag, correlations)
+        # 9. Safety check (updated for confluence)
+        is_safe, safety_reasons = self._safety_check(regime, metrics, event_flag, correlations, confluence)
         
-        # 10. Build and return packet
+        # 10. Build and return packet with confluence
         packet = RegimePacket(
             timestamp=datetime.now(),
             instrument_token=instrument_token,
@@ -136,6 +148,7 @@ class Sentinel(BaseAgent):
             disabled_instruments=disabled,
             is_safe=is_safe,
             safety_reasons=safety_reasons,
+            confluence=confluence,
             spot_price=spot_price,
             prev_close=prev_close,
             day_range_pct=day_range_pct,
@@ -173,7 +186,7 @@ class Sentinel(BaseAgent):
         ohlcv_5min: pd.DataFrame,
         ohlcv_daily: pd.DataFrame
     ) -> RegimeMetrics:
-        """Calculate all technical metrics."""
+        """Calculate all technical metrics including new BBW and RV/IV."""
         # ADX on 5-min data
         adx = calculate_adx(
             ohlcv_5min['high'],
@@ -201,11 +214,26 @@ class Sentinel(BaseAgent):
         current_rv = rv.iloc[-1] if not rv.empty else 0.15
         
         # IV percentile (using VIX as proxy if available)
-        # In production, fetch actual VIX data
         iv_percentile = self._calculate_iv_percentile(ohlcv_daily)
         
         # RV/ATR ratio
         rv_atr_ratio = current_rv / (current_atr / ohlcv_5min['close'].iloc[-1]) if current_atr > 0 else 1.0
+        
+        # NEW: Bollinger Band Width ratio
+        bbw = calculate_bollinger_band_width(ohlcv_5min['close'], period=20)
+        current_bbw = bbw.iloc[-1] if not bbw.empty else 0.02
+        bbw_ratio = calculate_bbw_ratio(ohlcv_5min['close'], period=20, avg_period=20)
+        current_bbw_ratio = bbw_ratio.iloc[-1] if not bbw_ratio.empty else 1.0
+        
+        # NEW: RV/IV ratio (vol overpriced if < 0.8)
+        iv_decimal = iv_percentile / 100 * 0.3  # Convert percentile to approx IV
+        rv_iv_ratio = current_rv / iv_decimal if iv_decimal > 0 else 1.0
+        
+        # NEW: Volume ratio
+        volume_ratio = 1.0
+        if 'volume' in ohlcv_5min.columns:
+            vol_ratio = calculate_volume_ratio(ohlcv_5min['volume'], period=20)
+            volume_ratio = vol_ratio.iloc[-1] if not vol_ratio.empty else 1.0
         
         return RegimeMetrics(
             adx=float(current_adx) if not np.isnan(current_adx) else 15.0,
@@ -214,8 +242,12 @@ class Sentinel(BaseAgent):
             realized_vol=float(current_rv) if not np.isnan(current_rv) else 0.15,
             atr=float(current_atr) if not np.isnan(current_atr) else 0.0,
             rv_atr_ratio=float(rv_atr_ratio) if not np.isnan(rv_atr_ratio) else 1.0,
-            skew=None,  # Would need option chain data
-            oi_change_pct=None  # Would need OI data
+            skew=None,
+            oi_change_pct=None,
+            bbw=float(current_bbw) if not np.isnan(current_bbw) else 0.02,
+            bbw_ratio=float(current_bbw_ratio) if not np.isnan(current_bbw_ratio) else 1.0,
+            rv_iv_ratio=float(rv_iv_ratio) if not np.isnan(rv_iv_ratio) else 1.0,
+            volume_ratio=float(volume_ratio) if not np.isnan(volume_ratio) else 1.0
         )
     
     def _calculate_iv_percentile(self, ohlcv_daily: pd.DataFrame) -> float:
@@ -241,47 +273,208 @@ class Sentinel(BaseAgent):
         metrics: RegimeMetrics,
         event_flag: bool,
         correlations: Dict[str, float]
-    ) -> Tuple[RegimeType, float]:
+    ) -> Tuple[RegimeType, float, ConfluenceScore]:
         """
-        Classify market regime using rule-based logic.
+        Classify market regime using confluence-based logic.
+        
+        Key change: Require 3+ triggers for CHAOS to prevent false positives.
+        2 triggers = CAUTION (allow hedged trades only).
         
         Priority:
-        1. CHAOS (highest priority - safety first)
-        2. RANGE_BOUND
-        3. MEAN_REVERSION
-        4. TREND
+        1. CHAOS (3+ triggers)
+        2. CAUTION (2 triggers)
+        3. RANGE_BOUND (low ADX + low BBW + neutral RSI)
+        4. MEAN_REVERSION (moderate ADX + extreme RSI)
+        5. TREND (high ADX)
         """
-        # CHAOS conditions (highest priority)
-        if event_flag:
-            return RegimeType.CHAOS, 0.9
+        confluence = ConfluenceScore()
         
-        if metrics.iv_percentile > IV_HIGH:
-            return RegimeType.CHAOS, 0.85
+        # === CHAOS TRIGGERS (negative score) ===
         
-        # Check correlation spike
-        if any(abs(v) > CORRELATION_CHAOS for v in correlations.values()):
-            return RegimeType.CHAOS, 0.8
+        # 1. Event blackout
+        confluence.add_trigger(
+            name="Event Blackout",
+            triggered=event_flag,
+            value=1.0 if event_flag else 0.0,
+            threshold=1.0,
+            direction="equals",
+            weight=2.0,
+            is_chaos=True
+        )
         
-        # RANGE_BOUND: Low ADX, moderate IV, neutral RSI
+        # 2. IV percentile > 75%
+        confluence.add_trigger(
+            name="IV Percentile",
+            triggered=metrics.iv_percentile > IV_HIGH,
+            value=metrics.iv_percentile,
+            threshold=IV_HIGH,
+            direction="above",
+            weight=1.5,
+            is_chaos=True
+        )
+        
+        # 3. Correlation spike (use dynamic threshold for intra-equity)
+        max_corr = max([abs(v) for v in correlations.values()], default=0)
+        confluence.add_trigger(
+            name="Correlation Spike",
+            triggered=max_corr > CORRELATION_INTRA_EQUITY,
+            value=max_corr,
+            threshold=CORRELATION_INTRA_EQUITY,
+            direction="above",
+            weight=1.0,
+            is_chaos=True
+        )
+        
+        # 4. ADX > 35 (strong trend/chaos)
+        confluence.add_trigger(
+            name="ADX Chaos",
+            triggered=metrics.adx > ADX_CHAOS,
+            value=metrics.adx,
+            threshold=ADX_CHAOS,
+            direction="above",
+            weight=1.5,
+            is_chaos=True
+        )
+        
+        # 5. BBW expansion (vol expansion)
+        bbw_ratio = metrics.bbw_ratio or 1.0
+        confluence.add_trigger(
+            name="BBW Expansion",
+            triggered=bbw_ratio > BBW_EXPANSION,
+            value=bbw_ratio,
+            threshold=BBW_EXPANSION,
+            direction="above",
+            weight=1.0,
+            is_chaos=True
+        )
+        
+        # 6. Volume surge
+        volume_ratio = metrics.volume_ratio or 1.0
+        confluence.add_trigger(
+            name="Volume Surge",
+            triggered=volume_ratio > VOLUME_SURGE,
+            value=volume_ratio,
+            threshold=VOLUME_SURGE,
+            direction="above",
+            weight=0.5,
+            is_chaos=True
+        )
+        
+        # === RANGE-BOUND TRIGGERS (positive score) ===
+        
+        # 1. Low ADX
+        confluence.add_trigger(
+            name="Low ADX",
+            triggered=metrics.adx < ADX_RANGE_BOUND,
+            value=metrics.adx,
+            threshold=ADX_RANGE_BOUND,
+            direction="below",
+            weight=1.5,
+            is_range=True
+        )
+        
+        # 2. Low BBW (range contraction)
+        confluence.add_trigger(
+            name="BBW Contraction",
+            triggered=bbw_ratio < BBW_RANGE_BOUND,
+            value=bbw_ratio,
+            threshold=BBW_RANGE_BOUND,
+            direction="below",
+            weight=1.5,
+            is_range=True
+        )
+        
+        # 3. Neutral RSI
+        rsi_neutral = RSI_NEUTRAL_LOW <= metrics.rsi <= RSI_NEUTRAL_HIGH
+        confluence.add_trigger(
+            name="Neutral RSI",
+            triggered=rsi_neutral,
+            value=metrics.rsi,
+            threshold=50.0,
+            direction="neutral",
+            weight=1.0,
+            is_range=True
+        )
+        
+        # 4. Low IV percentile (bonus for short-vol)
+        confluence.add_trigger(
+            name="Low IV Bonus",
+            triggered=metrics.iv_percentile < IV_LOW_VOL_BONUS,
+            value=metrics.iv_percentile,
+            threshold=IV_LOW_VOL_BONUS,
+            direction="below",
+            weight=1.0,
+            is_range=True
+        )
+        
+        # 5. RV/IV ratio < 0.8 (theta-friendly)
+        rv_iv = metrics.rv_iv_ratio or 1.0
+        confluence.add_trigger(
+            name="Theta Friendly",
+            triggered=rv_iv < RV_IV_THETA_FRIENDLY,
+            value=rv_iv,
+            threshold=RV_IV_THETA_FRIENDLY,
+            direction="below",
+            weight=1.0,
+            is_range=True
+        )
+        
+        # 6. Low volume (no trend fuel)
+        confluence.add_trigger(
+            name="Low Volume",
+            triggered=volume_ratio < VOLUME_LOW,
+            value=volume_ratio,
+            threshold=VOLUME_LOW,
+            direction="below",
+            weight=0.5,
+            is_range=True
+        )
+        
+        # === DETERMINE REGIME BASED ON CONFLUENCE ===
+        
+        chaos_count = confluence.chaos_triggers
+        range_count = confluence.range_triggers
+        
+        self.logger.debug(
+            f"Confluence: chaos_triggers={chaos_count}, range_triggers={range_count}, "
+            f"score={confluence.total_score:.2f}"
+        )
+        
+        # CHAOS: Require 3+ triggers (prevents false positives like Feb 5)
+        if chaos_count >= MIN_CHAOS_TRIGGERS:
+            confidence = min(0.7 + chaos_count * 0.1, 0.95)
+            return RegimeType.CHAOS, confidence, confluence
+        
+        # CAUTION: 2 triggers = allow hedged trades only
+        if chaos_count >= MIN_CAUTION_TRIGGERS:
+            confidence = 0.6 + chaos_count * 0.1
+            return RegimeType.CAUTION, confidence, confluence
+        
+        # RANGE_BOUND: Strong range signals (3+ range triggers, low chaos)
+        if range_count >= 3 and chaos_count == 0:
+            confidence = min(0.7 + range_count * 0.08, 0.95)
+            return RegimeType.RANGE_BOUND, confidence, confluence
+        
+        # RANGE_BOUND: Moderate range signals with low IV bonus
         if (metrics.adx < ADX_RANGE_BOUND and 
-            metrics.iv_percentile < IV_HIGH and
+            metrics.iv_percentile < IV_LOW and
             RSI_NEUTRAL_LOW <= metrics.rsi <= RSI_NEUTRAL_HIGH):
-            confidence = 1.0 - (metrics.adx / ADX_RANGE_BOUND) * 0.3
-            return RegimeType.RANGE_BOUND, confidence
+            confidence = 0.75
+            return RegimeType.RANGE_BOUND, confidence, confluence
         
-        # MEAN_REVERSION: Moderate ADX, extreme RSI
-        if (ADX_RANGE_BOUND <= metrics.adx <= ADX_TREND and
+        # MEAN_REVERSION: Moderate ADX + extreme RSI
+        if (ADX_RANGE_BOUND <= metrics.adx <= ADX_MEAN_REVERSION and
             (metrics.rsi < RSI_OVERSOLD or metrics.rsi > RSI_OVERBOUGHT)):
             confidence = 0.7 + abs(metrics.rsi - 50) / 100
-            return RegimeType.MEAN_REVERSION, min(confidence, 0.9)
+            return RegimeType.MEAN_REVERSION, min(confidence, 0.9), confluence
         
-        # TREND: High ADX
+        # TREND: High ADX but not chaos
         if metrics.adx > ADX_TREND:
-            confidence = min(0.6 + (metrics.adx - ADX_TREND) / 50, 0.95)
-            return RegimeType.TREND, confidence
+            confidence = min(0.6 + (metrics.adx - ADX_TREND) / 50, 0.85)
+            return RegimeType.TREND, confidence, confluence
         
-        # Default to MEAN_REVERSION with lower confidence
-        return RegimeType.MEAN_REVERSION, 0.5
+        # Default: MEAN_REVERSION with moderate confidence
+        return RegimeType.MEAN_REVERSION, 0.55, confluence
     
     def _ml_classify(self, metrics: RegimeMetrics) -> Tuple[Optional[RegimeType], float]:
         """
@@ -409,18 +602,24 @@ class Sentinel(BaseAgent):
         regime: RegimeType,
         metrics: RegimeMetrics,
         event_flag: bool,
-        correlations: Dict[str, float]
+        correlations: Dict[str, float],
+        confluence: ConfluenceScore
     ) -> Tuple[bool, List[str]]:
         """
-        Perform safety checks.
+        Perform safety checks with confluence awareness.
         
         Returns:
             Tuple of (is_safe, list of reasons if not safe)
         """
         reasons = []
         
+        # CHAOS is always unsafe
         if regime == RegimeType.CHAOS:
-            reasons.append("CHAOS regime detected")
+            reasons.append(f"CHAOS regime ({confluence.chaos_triggers} triggers)")
+        
+        # CAUTION allows hedged trades but flags as partially unsafe
+        if regime == RegimeType.CAUTION:
+            reasons.append(f"CAUTION regime ({confluence.chaos_triggers} triggers) - hedged trades only")
         
         if event_flag:
             reasons.append("Event blackout period")
@@ -428,10 +627,14 @@ class Sentinel(BaseAgent):
         if metrics.iv_percentile > IV_HIGH:
             reasons.append(f"IV percentile too high: {metrics.iv_percentile:.1f}%")
         
-        if any(abs(v) > CORRELATION_CHAOS for v in correlations.values()):
-            reasons.append("Correlation spike detected")
+        # Only flag correlation if it's a true spike (part of confluence)
+        max_corr = max([abs(v) for v in correlations.values()], default=0)
+        if max_corr > CORRELATION_INTRA_EQUITY and confluence.chaos_triggers >= MIN_CAUTION_TRIGGERS:
+            reasons.append(f"Correlation spike: {max_corr:.2f}")
         
-        is_safe = len(reasons) == 0
+        # Safe if RANGE_BOUND or MEAN_REVERSION with no major issues
+        is_safe = regime in [RegimeType.RANGE_BOUND, RegimeType.MEAN_REVERSION] and not event_flag
+        
         return is_safe, reasons
     
     def _get_symbol(self, token: int) -> str:
