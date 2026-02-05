@@ -1,0 +1,13 @@
+{
+  "last_updated": "2026-02-05T10:42:28.927184",
+  "high_watermark": 0.0,
+  "daily_pnl": 0.0,
+  "weekly_pnl": 0.0,
+  "monthly_pnl": 0.0,
+  "flat_days_remaining": 0,
+  "last_regime": null,
+  "open_position_ids": [],
+  "circuit_breaker_active": false,
+  "circuit_breaker_reason": null,
+  "trading_day_start": "2026-02-05"
+}

@@ -1,9 +1,16 @@
+# ===================
 # Environment
+# ===================
 .env
+.env.local
+.env.*.local
+*.local
+
+# ===================
+# Python / Backend
+# ===================
 venv/
 .venv/
-
-# Python
 __pycache__/
 *.py[cod]
 *$py.class
@@ -24,29 +31,70 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
+pip-log.txt
+pip-delete-this-directory.txt
 
-# IDE
+# ===================
+# Node / Frontend
+# ===================
+node_modules/
+dist/
+dist-ssr/
+.npm
+.yarn/
+*.tsbuildinfo
+
+# ===================
+# IDE / Editor
+# ===================
 .idea/
-.vscode/
+.vscode/*
+!.vscode/extensions.json
 *.swp
 *.swo
+*.sw?
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
 .DS_Store
 
+# ===================
 # Logs
-logs/*.log
+# ===================
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
 
+# ===================
 # Data
+# ===================
 data/*.csv
 data/*.pkl
 data/models/*.pkl
 
+# ===================
 # State
+# ===================
 state/*.json
 
+# ===================
 # Testing
+# ===================
 .pytest_cache/
 .coverage
 htmlcov/
+coverage/
 
-# Docs
-theory/
+# ===================
+# Docs / Misc
+# ===================
+backend/data/instruments_cache.json
+backend/data/trading.db
+backend/data/cache/256265_5minute.parquet
+backend/data/cache/256265_day.parquet
+backend/data/cache/260105_day.parquet
