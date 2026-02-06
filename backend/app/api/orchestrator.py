@@ -31,10 +31,22 @@ class Orchestrator:
         self.mode = mode
         self.running = False
         
-        # Initialize components
+        # Initialize components - try DB credentials first
+        from ..core.credentials import get_kite_credentials
+        creds = get_kite_credentials()
+        
+        if creds and not creds.get('is_expired'):
+            api_key = creds['api_key']
+            access_token = creds['access_token']
+            logger.info(f"Using DB credentials (user: {creds.get('user_id')})")
+        else:
+            api_key = config.kite_api_key
+            access_token = config.kite_access_token
+            logger.info("Using config credentials")
+        
         self.kite = KiteClient(
-            api_key=config.kite_api_key,
-            access_token=config.kite_access_token,
+            api_key=api_key,
+            access_token=access_token,
             paper_mode=(mode == "paper"),
             mock_mode=False
         )
@@ -52,7 +64,7 @@ class Orchestrator:
         
         logger.info(f"Orchestrator initialized in {mode.upper()} mode")
     
-    async def run(self, interval_seconds: int = 300):
+    async def run(self, interval_seconds: int = 30):
         """Main trading loop."""
         self.running = True
         logger.info("Starting trading loop")

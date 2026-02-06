@@ -21,8 +21,11 @@ from ..config.thresholds import (
 )
 from ..models.regime import RegimePacket, RegimeType
 from ..models.trade import TradeProposal, TradeLeg, LegType, StructureType
+from .iron_condor import IronCondorStrategy
 from .jade_lizard import JadeLizardStrategy
 from .butterfly import ButterflyStrategy, BrokenWingButterflyStrategy
+from .risk_reversal import RiskReversalStrategy
+from .strangle import StrangleStrategy
 
 
 class Strategist(BaseAgent):
@@ -38,7 +41,7 @@ class Strategist(BaseAgent):
     - Produce TradeProposal for Treasury approval
     """
     
-    def __init__(self, kite: KiteClient, config: Settings):
+    def __init__(self, kite: KiteClient, config: Settings, enabled_strategies: List[str] = None):
         super().__init__(kite, config, name="Strategist")
         self._expiry_cache: Dict[str, List[date]] = {}
         
@@ -46,16 +49,23 @@ class Strategist(BaseAgent):
         self._jade_lizard = JadeLizardStrategy(lot_size=50)
         self._butterfly = ButterflyStrategy(lot_size=50)
         self._bwb = BrokenWingButterflyStrategy(lot_size=50)
+        self._strangle = StrangleStrategy(self.kite)
+        
+        # Filter enabled strategies
+        self.enabled_strategies = enabled_strategies or [
+            "iron_condor", "jade_lizard", "butterfly", "naked_strangle"
+        ]
     
     def process(self, regime_packet: RegimePacket) -> List[TradeProposal]:
         """
         Generate trade proposals based on regime.
         
         Strategy selection:
-        - RANGE_BOUND: Iron Condor, Butterfly, Jade Lizard
+        - RANGE_BOUND: Iron Condor, Butterfly, Jade Lizard, Strangle
         - CAUTION: Jade Lizard only (hedged structure)
         - MEAN_REVERSION: Broken Wing Butterfly, Risk Reversal
-        - TREND/CHAOS: No new trades
+        - TREND: Risk Reversal (directional)
+        - CHAOS: No new trades
         
         Args:
             regime_packet: Current regime assessment from Sentinel
@@ -88,19 +98,28 @@ class Strategist(BaseAgent):
             self.logger.info("RANGE_BOUND - generating short-vol signals")
             
             # Iron Condor (primary)
-            ic_proposal = self._generate_iron_condor(regime_packet)
-            if ic_proposal:
-                proposals.append(ic_proposal)
+            if "iron_condor" in self.enabled_strategies:
+                ic_proposal = self._generate_iron_condor(regime_packet)
+                if ic_proposal:
+                    proposals.append(ic_proposal)
             
             # Butterfly (if high confidence and low BBW)
-            bf_proposal = self._generate_butterfly(regime_packet)
-            if bf_proposal:
-                proposals.append(bf_proposal)
+            if "butterfly" in self.enabled_strategies:
+                bf_proposal = self._generate_butterfly(regime_packet)
+                if bf_proposal:
+                    proposals.append(bf_proposal)
             
             # Jade Lizard (if IV > 35%)
-            jl_proposal = self._generate_jade_lizard(regime_packet)
-            if jl_proposal:
-                proposals.append(jl_proposal)
+            if "jade_lizard" in self.enabled_strategies:
+                jl_proposal = self._generate_jade_lizard(regime_packet)
+                if jl_proposal:
+                    proposals.append(jl_proposal)
+            
+            # Strangle (if IV is elevated)
+            if "naked_strangle" in self.enabled_strategies and regime_packet.metrics.iv_percentile > IV_ENTRY_MIN:
+                strangle_proposal = self._generate_strangle(regime_packet)
+                if strangle_proposal:
+                    proposals.append(strangle_proposal)
         
         # MEAN_REVERSION - directional strategies
         elif regime_packet.allows_directional():
@@ -111,11 +130,14 @@ class Strategist(BaseAgent):
             if bwb_proposal:
                 proposals.append(bwb_proposal)
         
-        # TREND - limited strategies
+        # TREND - directional strategies
         elif regime_packet.regime == RegimeType.TREND:
-            self.logger.info("TREND regime - limited strategies")
-            # Could add trend-following strategies here
-            pass
+            self.logger.info("TREND regime - generating directional signals")
+            
+            # Risk Reversal for directional moves
+            # rr_proposal = self._generate_risk_reversal(regime_packet)
+            # if rr_proposal:
+            #     proposals.append(rr_proposal)
         
         else:
             self.logger.debug(f"No signals for regime: {regime_packet.regime}")
@@ -166,6 +188,19 @@ class Strategist(BaseAgent):
             return None
         
         return self._bwb.generate_proposal(regime, option_chain, expiry)
+    
+    def _generate_strangle(self, regime: RegimePacket) -> Optional[TradeProposal]:
+        """Generate Strangle proposal using strategy module."""
+        symbol = regime.symbol
+        expiry = self._get_target_expiry(symbol, IC_MIN_DTE, IC_MAX_DTE)
+        if not expiry:
+            return None
+        
+        option_chain = self.kite.get_option_chain(symbol, expiry)
+        if option_chain.empty:
+            return None
+        
+        return self._strangle.generate_proposal(regime, option_chain, expiry)
     
     def _is_entry_window(self) -> bool:
         """Check if current time is within entry window."""

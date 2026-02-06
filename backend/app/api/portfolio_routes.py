@@ -171,6 +171,9 @@ async def get_positions(request: Request):
         account = service.get_account_summary()
         positions = service.get_positions()
         
+        # Sort positions by symbol by default
+        positions.sort(key=lambda p: p.tradingsymbol or "")
+        
         # Calculate totals
         total_pnl = sum(p.pnl for p in positions)
         total_margin = sum(p.margin_used for p in positions)

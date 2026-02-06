@@ -1,7 +1,7 @@
 """Regime detection and risk thresholds for Trading System v2.0"""
 
 # Regime Detection Thresholds (Revised per Feb 5 2026 analysis)
-ADX_RANGE_BOUND = 12       # ADX < 12 = Range-bound (low trend strength)
+ADX_RANGE_BOUND = 14       # ADX < 14 = Range-bound (raised from 12 per Grok Feb 5)
 ADX_MEAN_REVERSION = 25    # ADX 12-25 = Mean-reversion zone (mild/noisy trends)
 ADX_TREND = 25             # ADX > 25 = Trend (raised from 22)
 ADX_CHAOS = 35             # ADX > 35 + vol spike = Chaos
@@ -16,7 +16,7 @@ RSI_EXTREME_HIGH = 75      # RSI > 75 = Strong overbought for reversion
 # IV Thresholds
 IV_LOW = 35                # IV percentile < 35% = Low vol
 IV_HIGH = 75               # IV percentile > 75% = High vol / Chaos
-IV_ENTRY_MIN = 40          # Minimum IV for short-vol entries
+IV_ENTRY_MIN = 45          # Minimum IV for short-vol entries (loosened from 40 per Grok Feb 5)
 IV_LOW_VOL_BONUS = 25      # IV < 25% = Override mild ADX/corr triggers
 
 # Correlation Thresholds (Differentiated by asset type)
@@ -50,8 +50,8 @@ ML_CAUTION_PROBABILITY = 0.75    # 75-85% prob = CAUTION mode
 
 # Risk Limits
 MAX_MARGIN_PCT = 0.40          # Max 40% margin utilization
-MAX_LOSS_PER_TRADE = 0.01      # Max 1% loss per trade
-MAX_DAILY_LOSS = 0.03          # Max 3% daily loss
+MAX_LOSS_PER_TRADE = 0.015     # Max 1.5% loss per trade (raised from 1% per Grok Feb 5)
+MAX_DAILY_LOSS = 0.015         # Max 1.5% daily loss (tightened from 3% per Grok Feb 5)
 MAX_WEEKLY_LOSS = 0.05         # Max 5% weekly loss
 MAX_MONTHLY_LOSS = 0.10        # Max 10% monthly loss
 MAX_POSITIONS = 10             # Max concurrent positions multiple strategies can have multiple positions. Aggregate margin requirement can be capped here to restrict position sizes.
@@ -94,4 +94,24 @@ MIN_OPEN_INTEREST = 10000      # Minimum OI for strike selection
 
 # Slippage and Costs
 SLIPPAGE_PCT = 0.002           # 0.2% slippage assumption
-BROKERAGE_PCT = 0.0003         # 0.03% brokerage
+BROKERAGE_PCT = 0.0007         # 0.07% per order (not per trade value)
+
+# Order-based cost model
+# Charges are per ORDER, not per trade value
+# If all legs of a strategy are placed in one order, charge once
+# Entry order + Exit order = 2 orders per trade
+COST_PER_ORDER_PCT = 0.0007    # 0.07% per order
+
+# Trailing Profit Settings (NEW - Grok Feb 5)
+TRAILING_BBW_THRESHOLD = 1.8   # Extend winners when BBW > 1.8x 20-day avg
+TRAILING_PROFIT_MIN = 0.50     # Only trail if already at 50%+ of target profit
+TRAILING_EXTENSION = 1.2       # Extend target by 20% when trailing
+
+# Daily Brake Settings (NEW - Grok Feb 5)
+DAILY_LOSS_BRAKE = 0.015       # -1.5% daily loss triggers brake
+BRAKE_FLAT_DAYS = 1            # Flat for 1 day after brake triggered
+
+# Lots Ramping Settings (NEW - Grok Feb 5)
+LOTS_RAMP_THRESHOLD_1 = 1.10   # 10% equity growth -> 2 lots
+LOTS_RAMP_THRESHOLD_2 = 1.25   # 25% equity growth -> 3 lots
+MAX_LOTS = 3                   # Maximum lots per position

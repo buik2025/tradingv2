@@ -198,7 +198,7 @@ _orchestrator = None
 
 
 @router.post("/trading/start")
-async def start_trading(mode: str = "paper", background_tasks: BackgroundTasks = None):
+async def start_trading(mode: str = "paper", interval_seconds: int = 30, background_tasks: BackgroundTasks = None):
     """Start the trading system."""
     global _orchestrator
     
@@ -212,9 +212,9 @@ async def start_trading(mode: str = "paper", background_tasks: BackgroundTasks =
     _orchestrator = Orchestrator(config, mode)
     
     if background_tasks:
-        background_tasks.add_task(_orchestrator.run, 300)
+        background_tasks.add_task(_orchestrator.run, interval_seconds)
     
-    return {"message": f"Trading started in {mode.upper()} mode"}
+    return {"message": f"Trading started in {mode.upper()} mode with {interval_seconds}s interval"}
 
 
 @router.post("/trading/stop")
@@ -330,6 +330,9 @@ async def get_positions(request: Request):
                 "product": p.get("product", ""),
                 "source": "PAPER" if is_paper else "LIVE"
             })
+        
+        # Sort by symbol (tradingsymbol) by default
+        result.sort(key=lambda x: x.get("tradingsymbol", ""))
         
         return result
     except TokenExpiredException as e:
@@ -848,6 +851,9 @@ async def get_positions_with_margins(request: Request):
                 "margin_pct": 0,  # Will be calculated after we have total
                 "pnl_on_margin_pct": round(pnl_on_margin_pct, 2)
             })
+        
+        # Sort positions by symbol by default
+        result.sort(key=lambda x: x.get("tradingsymbol", ""))
         
         # Calculate margin percentage for each position (as % of total margin)
         for pos in result:

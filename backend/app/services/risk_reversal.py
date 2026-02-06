@@ -138,20 +138,74 @@ class RiskReversalStrategy:
         spot: float,
         direction: str
     ) -> Optional[Tuple[float, float]]:
-        """Select strikes for Risk Reversal."""
+        """Select strikes for Risk Reversal based on delta (~0.15)."""
         if option_chain.empty:
             return None
         
-        strikes = sorted(option_chain['strike'].unique())
+        # Target delta for risk reversal: ~0.15
+        target_delta = 0.15
+        
+        short_strike = None
+        long_strike = None
         
         if direction == "BULLISH":
-            # Short put ~3% OTM, Long call ~2% OTM
-            short_strike = min(strikes, key=lambda x: abs(x - spot * 0.97) if x < spot else float('inf'))
-            long_strike = min(strikes, key=lambda x: abs(x - spot * 1.02) if x > spot else float('inf'))
-        else:
-            # Short call ~3% OTM, Long put ~2% OTM
-            short_strike = min(strikes, key=lambda x: abs(x - spot * 1.03) if x > spot else float('inf'))
-            long_strike = min(strikes, key=lambda x: abs(x - spot * 0.98) if x < spot else float('inf'))
+            # Short put with delta ~-0.15 (absolute 0.15)
+            put_delta_diff = float('inf')
+            for _, row in option_chain[option_chain['instrument_type'] == 'PE'].iterrows():
+                delta = row.get('delta', 0)
+                if delta < -0.13 and delta > -0.18:  # OTM put delta range
+                    diff = abs(delta + target_delta)  # delta is negative for puts
+                    if diff < put_delta_diff:
+                        put_delta_diff = diff
+                        short_strike = row['strike']
+            
+            # Long call with delta ~0.15
+            call_delta_diff = float('inf')
+            for _, row in option_chain[option_chain['instrument_type'] == 'CE'].iterrows():
+                delta = row.get('delta', 0)
+                if delta > 0.13 and delta < 0.18:  # OTM call delta range
+                    diff = abs(delta - target_delta)
+                    if diff < call_delta_diff:
+                        call_delta_diff = diff
+                        long_strike = row['strike']
+        
+        else:  # BEARISH
+            # Short call with delta ~0.15
+            call_delta_diff = float('inf')
+            for _, row in option_chain[option_chain['instrument_type'] == 'CE'].iterrows():
+                delta = row.get('delta', 0)
+                if delta > 0.13 and delta < 0.18:  # OTM call delta range
+                    diff = abs(delta - target_delta)
+                    if diff < call_delta_diff:
+                        call_delta_diff = diff
+                        short_strike = row['strike']
+            
+            # Long put with delta ~-0.15 (absolute 0.15)
+            put_delta_diff = float('inf')
+            for _, row in option_chain[option_chain['instrument_type'] == 'PE'].iterrows():
+                delta = row.get('delta', 0)
+                if delta < -0.13 and delta > -0.18:  # OTM put delta range
+                    diff = abs(delta + target_delta)  # delta is negative for puts
+                    if diff < put_delta_diff:
+                        put_delta_diff = diff
+                        long_strike = row['strike']
+        
+        # Validate strikes
+        if not short_strike or not long_strike:
+            self.logger.warning(f"Could not find suitable delta strikes for {direction}: short={short_strike}, long={long_strike}")
+            return None
+        
+        # Ensure proper OTM relationships
+        if direction == "BULLISH":
+            if short_strike >= spot or long_strike <= spot:
+                self.logger.warning(f"Invalid strike relationship for BULLISH RR: short={short_strike}, long={long_strike}, spot={spot}")
+                return None
+        else:  # BEARISH
+            if short_strike <= spot or long_strike >= spot:
+                self.logger.warning(f"Invalid strike relationship for BEARISH RR: short={short_strike}, long={long_strike}, spot={spot}")
+                return None
+        
+        self.logger.debug(f"Selected delta-based strikes for {direction} RR: short={short_strike}, long={long_strike}")
         
         return short_strike, long_strike
     

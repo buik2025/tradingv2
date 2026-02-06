@@ -180,6 +180,135 @@ class StrategyBacktester:
     ):
         self.config = config or StrategyBacktestConfig()
         self.settings = settings or Settings()
+
+        # Initialize strategist for proposal generation
+        from ..services.strategist import Strategist
+        from ..core.kite_client import KiteClient
+        
+        # Create mock kite client for backtesting
+        class MockKiteClient:
+            def get_instruments(self, exchange):
+                # Return mock instruments DataFrame for NFO
+                import pandas as pd
+                from datetime import datetime, timedelta
+                
+                base_date = datetime.now()
+                expiries = []
+                for i in range(8):  # Next 8 weeks
+                    expiry = base_date + timedelta(days=(i+1)*7)
+                    # Find Thursday of that week (NIFTY expiry)
+                    days_ahead = (3 - expiry.weekday()) % 7
+                    expiry = expiry + timedelta(days=days_ahead)
+                    expiries.append(expiry.date())
+                
+                # Create mock instruments DataFrame
+                instruments = []
+                for expiry in expiries:
+                    instruments.extend([
+                        {
+                            'instrument_token': 100000 + len(instruments),
+                            'exchange_token': len(instruments),
+                            'tradingsymbol': f'NIFTY{expiry.strftime("%y%b").upper()}22000CE',
+                            'name': 'NIFTY',
+                            'last_price': 150.0,
+                            'expiry': expiry,
+                            'strike': 22000.0,
+                            'tick_size': 0.05,
+                            'lot_size': 50,
+                            'instrument_type': 'CE',
+                            'segment': 'NFO-OPT',
+                            'exchange': 'NFO'
+                        },
+                        {
+                            'instrument_token': 100000 + len(instruments) + 1,
+                            'exchange_token': len(instruments) + 1,
+                            'tradingsymbol': f'NIFTY{expiry.strftime("%y%b").upper()}22000PE',
+                            'name': 'NIFTY',
+                            'last_price': 120.0,
+                            'expiry': expiry,
+                            'strike': 22000.0,
+                            'tick_size': 0.05,
+                            'lot_size': 50,
+                            'instrument_type': 'PE',
+                            'segment': 'NFO-OPT',
+                            'exchange': 'NFO'
+                        }
+                    ])
+                
+                return pd.DataFrame(instruments)
+            
+            def get_option_chain(self, symbol, expiry):
+                # Return mock option chain DataFrame around NIFTY spot price
+                import pandas as pd
+                import numpy as np
+                
+                # NIFTY spot is around 25,700 from the logs
+                spot = 25700  # Current NIFTY level
+                
+                # Generate strikes around spot: -15% to +15%
+                min_strike = spot * 0.85
+                max_strike = spot * 1.15
+                strikes = np.arange(min_strike, max_strike + 100, 100)
+                strikes = np.round(strikes, -2)  # Round to nearest 100
+                
+                options = []
+                
+                for strike in strikes:
+                    # Generate realistic option data
+                    moneyness = strike / spot
+                    time_to_expiry = max(0.01, (expiry - pd.Timestamp.now().date()).days / 365)
+                    
+                    # Simple delta approximation
+                    if moneyness < 1:  # ITM/ATM calls, OTM puts
+                        call_delta = min(0.95, max(0.05, 0.5 + 0.4 * (1 - moneyness)))
+                        put_delta = max(-0.95, min(-0.05, -0.5 - 0.4 * (1 - moneyness)))
+                    else:  # OTM calls, ITM/ATM puts
+                        call_delta = max(0.01, min(0.45, 0.4 - 0.35 * (moneyness - 1)))
+                        put_delta = min(-0.01, max(-0.45, -0.4 + 0.35 * (moneyness - 1)))
+                    
+                    # Realistic premiums
+                    call_premium = max(5, spot * 0.01 * call_delta / time_to_expiry**0.5)
+                    put_premium = max(5, spot * 0.01 * abs(put_delta) / time_to_expiry**0.5)
+                    
+                    options.extend([
+                        {
+                            'strike': strike,
+                            'instrument_type': 'CE',
+                            'tradingsymbol': f'NIFTY{expiry.strftime("%y%b").upper()}{int(strike)}CE',
+                            'instrument_token': 200000 + len(options),
+                            'last_price': call_premium,
+                            'ltp': call_premium,
+                            'bid': call_premium * 0.95,
+                            'ask': call_premium * 1.05,
+                            'oi': np.random.randint(10000, 100000),
+                            'volume': np.random.randint(5000, 50000),
+                            'delta': call_delta,
+                            'gamma': 0.02,
+                            'theta': -10,
+                            'vega': 25
+                        },
+                        {
+                            'strike': strike,
+                            'instrument_type': 'PE',
+                            'tradingsymbol': f'NIFTY{expiry.strftime("%y%b").upper()}{int(strike)}PE',
+                            'instrument_token': 200000 + len(options) + 1,
+                            'last_price': put_premium,
+                            'ltp': put_premium,
+                            'bid': put_premium * 0.95,
+                            'ask': put_premium * 1.05,
+                            'oi': np.random.randint(10000, 100000),
+                            'volume': np.random.randint(5000, 50000),
+                            'delta': put_delta,
+                            'gamma': 0.02,
+                            'theta': -10,
+                            'vega': 25
+                        }
+                    ])
+                
+                return pd.DataFrame(options)
+        
+        mock_kite = MockKiteClient()
+        self.strategist = Strategist(kite=mock_kite, config=self.settings, enabled_strategies=self.config.strategies)
         
         # State
         self._capital: float = 0
@@ -196,6 +325,13 @@ class StrategyBacktester:
         
         # Trade counter
         self._trade_counter: int = 0
+        
+        # NEW: Brake system (Grok Feb 5)
+        self._brake_until: Optional[date] = None
+        self._brakes_triggered: int = 0
+        
+        # NEW: Lots ramping tracking
+        self._initial_capital: float = 0
     
     def run(
         self,
@@ -216,6 +352,7 @@ class StrategyBacktester:
         
         self._reset()
         self._capital = self.config.initial_capital
+        self._initial_capital = self.config.initial_capital  # For lots ramping
         self._equity_curve = [self._capital]
         
         # Ensure sorted
@@ -244,10 +381,17 @@ class StrategyBacktester:
             if self._current_date != bar_date:
                 self._on_new_day(bar_date)
             
-            # Check daily loss limit
+            # Check daily loss limit and brake system
             if self.config.stop_on_daily_loss:
                 if self._daily_pnl_amount / self._capital <= -self.config.max_daily_loss:
+                    # NEW: Trigger brake (Grok Feb 5)
+                    if self._brake_until is None or bar_date > self._brake_until:
+                        self._trigger_brake(bar_date)
                     continue
+            
+            # NEW: Check if brake is active (Grok Feb 5)
+            if self._brake_until and bar_date <= self._brake_until:
+                continue  # Skip trading during brake period
             
             # 1. Detect regime
             regime_packet = self._detect_regime(ohlcv_data.iloc[:i+1], indicators, i)
@@ -356,6 +500,32 @@ class StrategyBacktester:
         self._regime_history = []
         self._current_regime = None
         self._trade_counter = 0
+        self._brake_until = None
+        self._brakes_triggered = 0
+        self._initial_capital = 0
+    
+    def _trigger_brake(self, current_date: date) -> None:
+        """Trigger daily brake after loss limit hit (Grok Feb 5)."""
+        from ..config.thresholds import BRAKE_FLAT_DAYS
+        self._brake_until = current_date + timedelta(days=BRAKE_FLAT_DAYS)
+        self._brakes_triggered += 1
+        logger.warning(f"BRAKE TRIGGERED! Flat until {self._brake_until} (brake #{self._brakes_triggered})")
+    
+    def _calculate_lots(self) -> int:
+        """Calculate position lots based on equity growth (Grok Feb 5)."""
+        from ..config.thresholds import LOTS_RAMP_THRESHOLD_1, LOTS_RAMP_THRESHOLD_2, MAX_LOTS
+        
+        if self._initial_capital <= 0:
+            return 1
+        
+        equity_ratio = self._capital / self._initial_capital
+        
+        if equity_ratio >= LOTS_RAMP_THRESHOLD_2:
+            return min(3, MAX_LOTS)
+        elif equity_ratio >= LOTS_RAMP_THRESHOLD_1:
+            return min(2, MAX_LOTS)
+        else:
+            return 1
     
     def _on_new_day(self, new_date: date) -> None:
         """Handle new trading day."""
@@ -461,25 +631,65 @@ class StrategyBacktester:
         rsi: float,
         iv_pct: float
     ) -> Tuple[RegimeType, float]:
-        """Classify regime based on indicators."""
-        # CHAOS: High IV
-        if iv_pct > 75:
+        """Classify regime based on indicators (updated per Grok Feb 5)."""
+        from ..config.thresholds import ADX_RANGE_BOUND, ADX_TREND, ADX_CHAOS, IV_HIGH
+        
+        # CHAOS: Very high IV (>75%) AND high ADX (>35)
+        if iv_pct > IV_HIGH and adx > ADX_CHAOS:
             return RegimeType.CHAOS, 0.85
         
-        # RANGE_BOUND: Low ADX, neutral RSI
-        if adx < 12 and 40 <= rsi <= 60:
+        # RANGE_BOUND: Low ADX (<14), any RSI (relaxed from neutral only)
+        if adx < ADX_RANGE_BOUND:
             return RegimeType.RANGE_BOUND, 0.80
         
-        # MEAN_REVERSION: Moderate ADX, extreme RSI
-        if 12 <= adx <= 25 and (rsi < 30 or rsi > 70):
+        # MEAN_REVERSION: Moderate ADX (14-25), extreme RSI
+        if ADX_RANGE_BOUND <= adx <= ADX_TREND and (rsi < 30 or rsi > 70):
             return RegimeType.MEAN_REVERSION, 0.75
         
-        # TREND: High ADX
-        if adx > 25:
+        # TREND: High ADX (>25)
+        if adx > ADX_TREND:
             return RegimeType.TREND, 0.70
         
-        # Default: MEAN_REVERSION
-        return RegimeType.MEAN_REVERSION, 0.55
+        # CAUTION: Moderate ADX with neutral RSI
+        if ADX_RANGE_BOUND <= adx <= ADX_TREND:
+            return RegimeType.CAUTION, 0.60
+        
+        # Default: RANGE_BOUND (more permissive for trading)
+        return RegimeType.RANGE_BOUND, 0.55
+    
+    def _execute_proposal(
+        self,
+        proposal: TradeProposal,
+        regime: RegimePacket,
+        bar: pd.Series
+    ) -> None:
+        """Execute a trade proposal from strategist."""
+        self._trade_counter += 1
+        pos_id = f"BT_{proposal.structure}_{self._trade_counter}"
+        
+        # Apply position sizing with lots ramping (Grok Feb 5)
+        lots = self._calculate_lots()
+        position_size_pct = self.config.position_size_pct
+        
+        # Calculate size multiplier based on lots and position size
+        size_multiplier = position_size_pct * self._capital / proposal.max_loss * lots
+        
+        # Create backtest position from proposal
+        position = BacktestPosition(
+            id=pos_id,
+            strategy_type=proposal.structure.lower(),
+            entry_date=bar.name if hasattr(bar.name, 'date') else datetime.now(),
+            entry_price=bar['close'],
+            max_profit=proposal.max_profit * size_multiplier,
+            max_loss=proposal.max_loss * size_multiplier,
+            target_pnl=proposal.target_pnl * size_multiplier,
+            stop_loss=proposal.stop_loss * size_multiplier,
+            expiry=proposal.expiry,
+            regime_at_entry=regime.regime.value
+        )
+        
+        self._positions[pos_id] = position
+        logger.debug(f"Executed proposal {pos_id}: {proposal.structure} at {bar['close']:.2f}")
     
     def _check_entries(
         self,
@@ -487,21 +697,23 @@ class StrategyBacktester:
         regime: RegimePacket,
         data: pd.DataFrame
     ) -> None:
-        """Check for entry signals based on regime and strategy."""
+        """Check for entry signals using strategist."""
         # Skip if regime not safe
         if not regime.is_safe:
             return
         
         # Check margin utilization
         used_margin = sum(p.max_loss for p in self._positions.values())
-        if used_margin / self._capital > self.config.max_margin_pct:
+        if used_margin / self._capital > 0.4:  # 40% max margin
             return
         
-        # Generate signals based on regime
-        for strategy in self.config.strategies:
-            if self._should_enter(strategy, regime, bar):
-                self._open_position(strategy, regime, bar)
-                break  # One entry per bar
+        # Use strategist to generate proposals
+        proposals = self.strategist.process(regime)
+        
+        # Execute the best proposal (if any)
+        for proposal in proposals[:1]:  # Take only the best one
+            self._execute_proposal(proposal, regime, bar)
+            break  # One entry per bar
     
     def _should_enter(
         self,
@@ -703,8 +915,9 @@ class StrategyBacktester:
         else:
             return
         
-        # Apply position sizing
-        size_multiplier = self.config.position_size_pct * self._capital / max_loss
+        # Apply position sizing with lots ramping (Grok Feb 5)
+        lots = self._calculate_lots()
+        size_multiplier = self.config.position_size_pct * self._capital / max_loss * lots
         max_profit *= size_multiplier
         max_loss *= size_multiplier
         target_pnl *= size_multiplier
@@ -759,6 +972,19 @@ class StrategyBacktester:
             theta_decay = position.max_profit * (days_held / 10) * 0.7
             price_impact = (spot - entry) / entry * position.max_loss * 2
             position.current_pnl = theta_decay - abs(price_impact)
+        elif position.strategy_type.lower() == "naked_strangle":
+            # Strangle: profit from theta decay, but sensitive to directional moves
+            days_held = position.days_held + 1
+            theta_decay = position.max_profit * (days_held / 10) * 0.8  # Higher theta for naked options
+            
+            # Calculate directional impact (strangle is more sensitive to direction)
+            # If spot moves significantly in either direction, losses increase
+            move_pct = abs(spot - entry) / entry
+            if move_pct > 0.05:  # 5% move starts hurting
+                directional_loss = position.max_loss * (move_pct - 0.05) * 3  # Accelerating losses
+                position.current_pnl = theta_decay - directional_loss
+            else:
+                position.current_pnl = theta_decay
         else:
             # Debit strategies
             price_move = (spot - entry) / entry
@@ -766,8 +992,15 @@ class StrategyBacktester:
         
         position.days_held += 1
         
-        # Check profit target
+        # Check profit target with trailing logic (Grok Feb 5)
         if position.current_pnl >= position.target_pnl:
+            # NEW: Check if we should trail instead of exit
+            if self._should_trail_profit(position, regime):
+                # Extend target by 20%
+                from ..config.thresholds import TRAILING_EXTENSION
+                position.target_pnl *= TRAILING_EXTENSION
+                logger.debug(f"Trailing profit for {position.id}: new target {position.target_pnl:.2f}")
+                return None  # Don't exit yet
             return "PROFIT_TARGET"
         
         # Check stop loss
@@ -790,6 +1023,32 @@ class StrategyBacktester:
         
         return None
     
+    def _should_trail_profit(self, position: BacktestPosition, regime: RegimePacket) -> bool:
+        """
+        Check if position should trail profit instead of exiting (Grok Feb 5).
+        
+        Trail when:
+        - BBW > 1.8x 20-day average (vol expansion favorable for continuation)
+        - Already at 50%+ of target profit
+        - Regime is still favorable (RANGE_BOUND or MEAN_REVERSION)
+        """
+        from ..config.thresholds import TRAILING_BBW_THRESHOLD, TRAILING_PROFIT_MIN
+        
+        # Only trail if at minimum profit threshold
+        if position.current_pnl < position.target_pnl * TRAILING_PROFIT_MIN:
+            return False
+        
+        # Only trail in favorable regimes
+        if regime.regime not in [RegimeType.RANGE_BOUND, RegimeType.MEAN_REVERSION]:
+            return False
+        
+        # Check BBW ratio (use ADX as proxy if BBW not available)
+        # Lower ADX = more range-bound = better for trailing short-vol
+        if regime.metrics.adx < 20:
+            return True
+        
+        return False
+    
     def _close_position(
         self,
         pos_id: str,
@@ -799,14 +1058,24 @@ class StrategyBacktester:
         """Close a position and record the trade."""
         position = self._positions.pop(pos_id)
         
-        # Calculate final P&L with costs
+        # Calculate final P&L with order-based costs
+        # Costs are per ORDER (0.07%), not per trade value
+        # Entry = 1 order, Exit = 1 order = 2 orders total
+        from ..config.thresholds import COST_PER_ORDER_PCT
+        
         pnl = position.current_pnl
-        costs = abs(pnl) * self.config.brokerage_pct * 2
-        pnl -= costs
+        
+        # Order-based costs: 0.07% per order × 2 orders (entry + exit)
+        # Applied to the notional value (entry_price × lot_size equivalent)
+        notional_value = position.entry_price * 50  # Approximate lot value
+        order_costs = notional_value * COST_PER_ORDER_PCT * 2  # Entry + Exit orders
+        pnl -= order_costs
         
         # Apply slippage
         slippage = abs(pnl) * self.config.slippage_pct
         pnl -= slippage
+        
+        costs = order_costs + slippage
         
         # Update capital
         self._capital += pnl
