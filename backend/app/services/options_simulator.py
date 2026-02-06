@@ -371,12 +371,31 @@ class OptionsSimulator:
         if underlying_data.empty:
             return pd.DataFrame()
         
+        # Determine interval (minutes)
+        interval_minutes = 1440 # Default to daily
+        if isinstance(underlying_data.index, pd.DatetimeIndex) and len(underlying_data) > 1:
+             delta = (underlying_data.index[1] - underlying_data.index[0]).total_seconds() / 60
+             if delta < 1400: # Less than a day
+                 interval_minutes = int(delta)
+        
         # Estimate IV if not provided
         if iv_data is None:
             # Use Parkinson volatility as IV proxy
+            # Adjust for data interval
+            bars_per_day = 75 if interval_minutes == 5 else 1  # Assume 5-min or Daily
+            if 'datetime' in underlying_data.columns and len(underlying_data) > 1:
+                # Try to infer interval
+                dt = (underlying_data.index[1] - underlying_data.index[0]).total_seconds() / 60
+                if dt > 0:
+                    bars_per_day = 375 / dt  # 375 mins in trading day
+            
+            annualization_factor = np.sqrt(252 * bars_per_day)
+            
             log_hl = np.log(underlying_data['high'] / underlying_data['low'])
             parkinson_vol = np.sqrt(1 / (4 * np.log(2)) * (log_hl ** 2))
-            iv_series = parkinson_vol.rolling(20).mean() * np.sqrt(252)  # Annualize
+            
+            # Use longer window for stability
+            iv_series = parkinson_vol.rolling(window=int(20*bars_per_day)).mean() * annualization_factor
             iv_series = iv_series.fillna(0.15)  # Default 15% IV
         else:
             iv_series = iv_data['iv'] if 'iv' in iv_data.columns else iv_data.iloc[:, 0]

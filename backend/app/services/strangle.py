@@ -5,17 +5,23 @@ Targets 0.8-1% profit on margin with proper risk controls.
 """
 
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 import numpy as np
+import pandas as pd
 from loguru import logger
 
 from ..models.trade import TradeProposal, TradeLeg, LegType
 from ..models.regime import RegimePacket, RegimeType
 from ..config.thresholds import (
     MAX_LOSS_PER_TRADE,
-    IV_ENTRY_MIN,
+    IV_PERCENTILE_SHORT_VOL,
+    IV_PERCENTILE_STRANGLE,
+    STRANGLE_DELTA_TARGET,
+    STRANGLE_PROFIT_TARGET,
     MIN_BID_ASK_SPREAD,
-    MIN_OPEN_INTEREST
+    MIN_OPEN_INTEREST,
+    RSI_NEUTRAL_MIN,
+    RSI_NEUTRAL_MAX
 )
 
 
@@ -45,9 +51,10 @@ class StrangleStrategy:
         spot = regime.spot_price
         
         # Check IV condition (need elevated IV for better premiums)
-        if regime.metrics.iv_percentile < IV_ENTRY_MIN:
-            self.logger.debug(f"IV too low for strangle: {regime.metrics.iv_percentile:.1f}% < {IV_ENTRY_MIN}%")
-            return None
+        # Check IV condition
+        # Strangles work best in low-to-moderate IV (theta decay) or high IV (premium)
+        # We prioritize low IV range-bound
+        pass  # Logic moved to _is_regime_suitable
         
         # Check regime suitability
         if not self._is_regime_suitable(regime):
@@ -61,12 +68,23 @@ class StrangleStrategy:
             return None
         
         # Get option details
-        call_option = option_chain['calls'].get(call_strike)
-        put_option = option_chain['puts'].get(put_strike)
-        
-        if not call_option or not put_option:
-            self.logger.debug("Missing option data for selected strikes")
-            return None
+        if isinstance(option_chain, pd.DataFrame):
+            call_option_rows = option_chain[(option_chain['strike'] == call_strike) & (option_chain['instrument_type'] == 'CE')]
+            put_option_rows = option_chain[(option_chain['strike'] == put_strike) & (option_chain['instrument_type'] == 'PE')]
+            
+            if call_option_rows.empty or put_option_rows.empty:
+                self.logger.debug("Missing option data for selected strikes")
+                return None
+            
+            call_option = call_option_rows.iloc[0].to_dict()
+            put_option = put_option_rows.iloc[0].to_dict()
+        else:
+            call_option = option_chain['calls'].get(call_strike)
+            put_option = option_chain['puts'].get(put_strike)
+            
+            if not call_option or not put_option:
+                self.logger.debug("Missing option data for selected strikes")
+                return None
         
         # Check liquidity
         if not self._check_liquidity(call_option, put_option):
@@ -75,7 +93,8 @@ class StrangleStrategy:
         # Calculate position metrics
         premium = call_option['last_price'] + put_option['last_price']
         margin = self._estimate_margin(spot, call_strike, put_strike)
-        profit_target_pct = 0.009  # 0.9% target (between 0.8-1%)
+        margin = self._estimate_margin(spot, call_strike, put_strike)
+        profit_target_pct = STRANGLE_PROFIT_TARGET
         profit_target = margin * profit_target_pct
         
         # Check risk-reward
@@ -132,54 +151,92 @@ class StrangleStrategy:
         return proposal
     
     def _is_regime_suitable(self, regime: RegimePacket) -> bool:
-        """Check if regime is suitable for strangle."""
-        # Best regime: RANGE_BOUND - market stays within range, we collect premium
-        # Also works in CAUTION with elevated IV
+        """Strangles are BEST for RANGE_BOUND markets."""
         
+        # PRIMARY: Range-bound with low ADX
         if regime.regime == RegimeType.RANGE_BOUND:
-            # Perfect for strangles - low ADX means market won't break out
-            return True
-        
-        if regime.regime == RegimeType.CAUTION:
-            # Can work if IV is high enough for good premium
-            return regime.metrics.iv_percentile > 50  # Need higher IV in caution
+            # Perfect for strangles - low ADX means no breakout
+            # If IV is ultra-low (<15%), it's the "Strangle Zone"
+            if regime.metrics.iv_percentile < IV_PERCENTILE_STRANGLE:
+                return True
+            # Also good if IV is just low/moderate
+            elif regime.metrics.iv_percentile < IV_PERCENTILE_SHORT_VOL:
+                return True
+            
+        # SECONDARY: Mean-reversion with neutral RSI
+        if regime.regime == RegimeType.MEAN_REVERSION:
+            # Only if RSI neutral (35-65), not at extremes
+            if RSI_NEUTRAL_MIN < regime.metrics.rsi < RSI_NEUTRAL_MAX:
+                return regime.metrics.iv_percentile < IV_PERCENTILE_SHORT_VOL
         
         return False
     
     def _select_strikes(
         self,
         spot: float,
-        option_chain: Dict,
+        option_chain,  # Can be Dict or DataFrame
         regime: RegimePacket
     ) -> Tuple[Optional[float], Optional[float]]:
-        """Select OTM strikes for strangle based on delta (~0.3)."""
+        """Select OTM strikes for strangle based on delta (~0.30)."""
         
         # Target delta for strangle: PE delta ~0.3, CE delta ~0.3
-        target_delta = 0.30
+        target_delta = STRANGLE_DELTA_TARGET
         
-        # Find call option with delta closest to 0.3
-        call_strike = None
-        call_delta_diff = float('inf')
+        # Handle DataFrame option chain (from backtester)
+        if isinstance(option_chain, pd.DataFrame):
+            calls_df = option_chain[option_chain['instrument_type'] == 'CE'] if 'instrument_type' in option_chain.columns else pd.DataFrame()
+            puts_df = option_chain[option_chain['instrument_type'] == 'PE'] if 'instrument_type' in option_chain.columns else pd.DataFrame()
+            
+            call_strike = None
+            call_delta_diff = float('inf')
+            
+            for _, row in calls_df.iterrows():
+                delta = row.get('delta', 0)
+                strike = row.get('strike', 0)
+                if delta > 0.26 and delta < 0.33:  # OTM call delta range
+                    diff = abs(delta - target_delta)
+                    if diff < call_delta_diff:
+                        call_delta_diff = diff
+                        call_strike = strike
+            
+            put_strike = None
+            put_delta_diff = float('inf')
+            
+            for _, row in puts_df.iterrows():
+                delta = row.get('delta', 0)
+                strike = row.get('strike', 0)
+                if delta < -0.26 and delta > -0.33:  # OTM put delta range
+                    diff = abs(delta + target_delta)  # delta is negative for puts
+                    if diff < put_delta_diff:
+                        put_delta_diff = diff
+                        put_strike = strike
         
-        for strike, option_data in option_chain['calls'].items():
-            delta = option_data.get('delta', 0)
-            if delta > 0.26 and delta < 0.33:  # OTM call delta range
-                diff = abs(delta - target_delta)
-                if diff < call_delta_diff:
-                    call_delta_diff = diff
-                    call_strike = strike
-        
-        # Find put option with delta closest to -0.3 (absolute 0.3)
-        put_strike = None
-        put_delta_diff = float('inf')
-        
-        for strike, option_data in option_chain['puts'].items():
-            delta = option_data.get('delta', 0)
-            if delta < -0.26 and delta > -0.33:  # OTM put delta range
-                diff = abs(delta + target_delta)  # delta is negative for puts
-                if diff < put_delta_diff:
-                    put_delta_diff = diff
-                    put_strike = strike
+        # Handle dict option chain (from live trading)
+        elif isinstance(option_chain, dict) and 'calls' in option_chain and 'puts' in option_chain:
+            call_strike = None
+            call_delta_diff = float('inf')
+            
+            for strike, option_data in option_chain['calls'].items():
+                delta = option_data.get('delta', 0)
+                if delta > 0.26 and delta < 0.33:  # OTM call delta range
+                    diff = abs(delta - target_delta)
+                    if diff < call_delta_diff:
+                        call_delta_diff = diff
+                        call_strike = strike
+            
+            put_strike = None
+            put_delta_diff = float('inf')
+            
+            for strike, option_data in option_chain['puts'].items():
+                delta = option_data.get('delta', 0)
+                if delta < -0.26 and delta > -0.33:  # OTM put delta range
+                    diff = abs(delta + target_delta)  # delta is negative for puts
+                    if diff < put_delta_diff:
+                        put_delta_diff = diff
+                        put_strike = strike
+        else:
+            self.logger.debug("Unsupported option_chain format")
+            return None, None
         
         # Validate strikes
         if not call_strike or not put_strike:
@@ -195,7 +252,7 @@ class StrangleStrategy:
             self.logger.debug(f"Put strike {put_strike} is not OTM (spot={spot})")
             return None, None
         
-        self.logger.debug(f"Selected delta-based strikes: C{call_strike} (Δ≈{option_chain['calls'][call_strike].get('delta', 0):.2f}), P{put_strike} (Δ≈{option_chain['puts'][put_strike].get('delta', 0):.2f})")
+        self.logger.debug(f"Selected delta-based strikes: C{call_strike}, P{put_strike}")
         
         return call_strike, put_strike
     

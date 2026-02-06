@@ -18,6 +18,8 @@ from ..models.trade import TradeSignal, TradeLeg
 from ..models.order import OrderTicket, ExecutionResult, ExitOrder, OrderStatus, TransactionType, OrderType, ProductType
 from ..models.position import Position, PositionStatus
 from ..models.regime import RegimeType
+from ..database.repository import Repository
+from ..database.models import BrokerPosition
 
 
 class Executor(BaseAgent):
@@ -37,6 +39,11 @@ class Executor(BaseAgent):
         super().__init__(kite, config, name="Executor")
         self._pending_orders: Dict[str, OrderTicket] = {}
         self._positions: Dict[str, Position] = {}
+        self.repository = Repository()
+        
+        # Load paper positions if in paper mode
+        if self.kite.paper_mode:
+            self._load_positions()
     
     def process(self, signal: TradeSignal) -> ExecutionResult:
         """
@@ -80,6 +87,8 @@ class Executor(BaseAgent):
             position = self._create_position(signal, orders)
             if position:
                 self._positions[position.id] = position
+                if self.kite.paper_mode:
+                    self._persist_paper_position(position)
         else:
             # Rollback successful orders if partial failure
             self._rollback_orders([o for o in orders if o.status == OrderStatus.OPEN])
@@ -361,6 +370,9 @@ class Executor(BaseAgent):
         # Close position
         position.close(exit_value, exit_order.exit_reason)
         
+        if self.kite.paper_mode:
+             self._persist_paper_position(position)
+        
         result = ExecutionResult(
             signal_id=position.signal_id,
             success=all(o.is_complete for o in orders),
@@ -410,4 +422,42 @@ class Executor(BaseAgent):
         """Sync positions with broker."""
         broker_positions = self.kite.get_positions()
         # Implementation would reconcile local positions with broker
+        pass
+
+    def _persist_paper_position(self, position: Position) -> None:
+        """Persist paper position to database."""
+        try:
+            for leg in position.legs:
+                # Map domain leg to DB BrokerPosition
+                # Net quantity logic: positive for long, negative for short
+                qty = leg.quantity if leg.is_long else -leg.quantity
+                
+                # If position closed, qty is 0 (or we assume flattened)
+                if position.status != PositionStatus.OPEN:
+                    qty = 0
+                
+                bp = BrokerPosition(
+                     id=f"PAPER_{leg.instrument_token}", # Unique ID for paper pos
+                     tradingsymbol=leg.tradingsymbol,
+                     instrument_token=leg.instrument_token,
+                     exchange=leg.exchange,
+                     quantity=qty,
+                     average_price=leg.entry_price,
+                     last_price=leg.current_price,
+                     pnl=0, # Calculated dynamically by PortfolioService
+                     product="NRML", # Default
+                     transaction_type="BUY" if qty > 0 else "SELL",
+                     source="PAPER",
+                     broker_order_id=f"PAPER_ORD_{leg.instrument_token}"
+                )
+                self.repository.save_broker_position(bp)
+            self.logger.info(f"Persisted paper position {position.id}")
+        except Exception as e:
+            self.logger.error(f"Failed to persist paper position: {e}")
+
+    def _load_positions(self) -> None:
+        """Load paper positions from DB (Best effort)."""
+        # Retrieving positions for UI visibility is handled by PortfolioService.
+        # Rehydrating Executor state is complex without strategy metadata.
+        # For now, we rely on in-memory state for active management during the session.
         pass

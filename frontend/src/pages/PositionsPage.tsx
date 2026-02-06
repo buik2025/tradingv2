@@ -27,6 +27,7 @@ export function PositionsPage() {
   const [sortDirection, setSortDirection] = useState<SortDirection>('desc');
   const [searchTerm, setSearchTerm] = useState('');
   const [filterExchange, setFilterExchange] = useState<string>('all');
+  const [filterSource, setFilterSource] = useState<'all' | 'LIVE' | 'PAPER'>('all');
   const [selectedPositions, setSelectedPositions] = useState<Set<string>>(new Set());
   const [showCreateStrategy, setShowCreateStrategy] = useState(false);
   const [newStrategyName, setNewStrategyName] = useState('');
@@ -121,6 +122,10 @@ export function PositionsPage() {
 
     if (filterExchange !== 'all') {
       result = result.filter(p => p.exchange === filterExchange);
+    }
+
+    if (filterSource !== 'all') {
+      result = result.filter(p => p.source === filterSource);
     }
 
     result.sort((a, b) => {
@@ -245,6 +250,15 @@ export function PositionsPage() {
                 <option value="all">All Exchanges</option>
                 {uniqueExchanges.map(ex => <option key={ex} value={ex}>{ex}</option>)}
               </select>
+              <select
+                value={filterSource}
+                onChange={(e) => setFilterSource(e.target.value as 'all' | 'LIVE' | 'PAPER')}
+                className="px-3 py-2 text-sm bg-[var(--background)] border border-[var(--border)] rounded-md focus:outline-none"
+              >
+                <option value="all">All Sources</option>
+                <option value="LIVE">Live (Kite)</option>
+                <option value="PAPER">Paper (Simulator)</option>
+              </select>
               <Button variant="outline" size="sm" onClick={fetchData} disabled={isRefreshing}>
                 <RefreshCw className={`h-4 w-4 mr-1 ${isRefreshing ? 'animate-spin' : ''}`} />
                 Refresh
@@ -276,6 +290,9 @@ export function PositionsPage() {
                   </th>
                   <th className="text-left py-3 px-4 text-sm font-medium text-[var(--muted-foreground)] cursor-pointer hover:text-[var(--foreground)]" onClick={() => handleSort('exchange')}>
                     <div className="flex items-center">Exchange <SortIcon field="exchange" /></div>
+                  </th>
+                  <th className="text-left py-3 px-4 text-sm font-medium text-[var(--muted-foreground)] cursor-pointer hover:text-[var(--foreground)]" onClick={() => handleSort('source')}>
+                    <div className="flex items-center">Source <SortIcon field="source" /></div>
                   </th>
                   <th className="text-right py-3 px-4 text-sm font-medium text-[var(--muted-foreground)] cursor-pointer hover:text-[var(--foreground)]" onClick={() => handleSort('quantity')}>
                     <div className="flex items-center justify-end">Qty <SortIcon field="quantity" /></div>
@@ -317,6 +334,18 @@ export function PositionsPage() {
                     <td className="py-3 px-4 font-medium">{position.tradingsymbol}</td>
                     <td className="py-3 px-4">
                       <Badge variant="outline">{position.exchange}</Badge>
+                    </td>
+                    <td className="py-3 px-4">
+                      <Badge
+                        variant="outline"
+                        className={
+                          position.source === 'PAPER'
+                            ? 'text-[var(--primary)] border-[var(--primary)]'
+                            : 'text-[var(--muted-foreground)]'
+                        }
+                      >
+                        {position.source === 'PAPER' ? 'Paper' : 'Live'}
+                      </Badge>
                     </td>
                     <td className="py-3 px-4 text-right">{position.quantity}</td>
                     <td className="py-3 px-4 text-right">{formatCurrency(position.average_price)}</td>

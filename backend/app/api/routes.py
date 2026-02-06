@@ -1583,8 +1583,8 @@ async def get_current_regime(request: Request):
 def _build_regime_explanation(regime) -> dict:
     """Build detailed explanation of how regime was classified."""
     from ..config.thresholds import (
-        ADX_RANGE_BOUND, ADX_TREND,
-        RSI_OVERSOLD, RSI_OVERBOUGHT, RSI_NEUTRAL_LOW, RSI_NEUTRAL_HIGH,
+        ADX_RANGE_BOUND, ADX_TREND_MIN,
+        RSI_OVERSOLD, RSI_OVERBOUGHT, RSI_NEUTRAL_MIN, RSI_NEUTRAL_MAX,
         IV_HIGH, CORRELATION_CHAOS
     )
     
@@ -1636,18 +1636,18 @@ def _build_regime_explanation(regime) -> dict:
         "step": 4,
         "check": "ADX (Trend Strength)",
         "condition": f"ADX {metrics.adx:.1f} {'<' if adx_range else '>='} {ADX_RANGE_BOUND} (Range-Bound threshold)",
-        "result": "LOW" if adx_range else ("HIGH" if metrics.adx > ADX_TREND else "MODERATE"),
-        "impact": "Suggests Range-Bound" if adx_range else ("Suggests Trend" if metrics.adx > ADX_TREND else "Suggests Mean-Reversion")
+        "result": "LOW" if adx_range else ("HIGH" if metrics.adx > ADX_TREND_MIN else "MODERATE"),
+        "impact": "Suggests Range-Bound" if adx_range else ("Suggests Trend" if metrics.adx > ADX_TREND_MIN else "Suggests Mean-Reversion")
     })
     
     # Step 5: RSI check
-    rsi_neutral = RSI_NEUTRAL_LOW <= metrics.rsi <= RSI_NEUTRAL_HIGH
+    rsi_neutral = RSI_NEUTRAL_MIN <= metrics.rsi <= RSI_NEUTRAL_MAX
     rsi_extreme = metrics.rsi < RSI_OVERSOLD or metrics.rsi > RSI_OVERBOUGHT
     rsi_label = "NEUTRAL" if rsi_neutral else ("OVERSOLD" if metrics.rsi < RSI_OVERSOLD else ("OVERBOUGHT" if metrics.rsi > RSI_OVERBOUGHT else "MODERATE"))
     steps.append({
         "step": 5,
         "check": "RSI (Momentum)",
-        "condition": f"RSI {metrics.rsi:.1f} in range [{RSI_NEUTRAL_LOW}-{RSI_NEUTRAL_HIGH}] neutral, <{RSI_OVERSOLD} oversold, >{RSI_OVERBOUGHT} overbought",
+        "condition": f"RSI {metrics.rsi:.1f} in range [{RSI_NEUTRAL_MIN}-{RSI_NEUTRAL_MAX}] neutral, <{RSI_OVERSOLD} oversold, >{RSI_OVERBOUGHT} overbought",
         "result": rsi_label,
         "impact": "Supports Range-Bound" if rsi_neutral else ("Supports Mean-Reversion" if rsi_extreme else "Neutral impact")
     })
@@ -1661,7 +1661,7 @@ def _build_regime_explanation(regime) -> dict:
     elif regime_value == "MEAN_REVERSION":
         decision = f"Moderate ADX ({metrics.adx:.1f}) + Extreme RSI ({metrics.rsi:.1f}) suggests reversal opportunity"
     elif regime_value == "TREND":
-        decision = f"High ADX ({metrics.adx:.1f} > {ADX_TREND}) indicates strong directional momentum"
+        decision = f"High ADX ({metrics.adx:.1f} > {ADX_TREND_MIN}) indicates strong directional momentum"
     else:
         decision = "Unable to classify with confidence"
     

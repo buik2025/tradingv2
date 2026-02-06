@@ -23,6 +23,7 @@ export function StrategiesPage() {
   const [expandedStrategies, setExpandedStrategies] = useState<Set<string>>(new Set());
   const [isLoading, setIsLoading] = useState(true);
   const [isRefreshing, setIsRefreshing] = useState(false);
+  const [filterSource, setFilterSource] = useState<'all' | 'LIVE' | 'PAPER'>('all');
 
   const fetchData = useCallback(async () => {
     setIsRefreshing(true);
@@ -62,21 +63,26 @@ export function StrategiesPage() {
       return strategy;
     });
   }, [data?.strategies, wsStrategies]);
+
+  const filteredStrategies = useMemo(() => {
+    if (filterSource === 'all') return strategies;
+    return strategies.filter((s) => s.source === filterSource);
+  }, [strategies, filterSource]);
   
   const account = data?.account;
   
   // Recalculate totals when strategies update from WebSocket
   const totals = useMemo(() => {
-    if (!strategies.length) return data?.totals;
-    const totalPnl = strategies.reduce((sum, s) => sum + s.total_pnl, 0);
-    const totalMargin = strategies.reduce((sum, s) => sum + s.total_margin, 0);
+    if (!filteredStrategies.length) return data?.totals;
+    const totalPnl = filteredStrategies.reduce((sum, s) => sum + s.total_pnl, 0);
+    const totalMargin = filteredStrategies.reduce((sum, s) => sum + s.total_margin, 0);
     return {
       pnl: totalPnl,
       margin: totalMargin,
       pnl_on_margin_pct: totalMargin > 0 ? (totalPnl / totalMargin * 100) : 0,
-      count: strategies.length
+      count: filteredStrategies.length
     };
-  }, [strategies, data?.totals]);
+  }, [filteredStrategies, data?.totals]);
 
   useEffect(() => {
     if (highlightId && strategies.length > 0) {
@@ -162,21 +168,32 @@ export function StrategiesPage() {
       <Card>
         <CardHeader>
           <div className="flex items-center justify-between">
-            <CardTitle>Strategies ({strategies.length})</CardTitle>
-            <Button variant="outline" size="sm" onClick={fetchData} disabled={isRefreshing}>
-              <RefreshCw className={`h-4 w-4 mr-1 ${isRefreshing ? 'animate-spin' : ''}`} />
-              Refresh
-            </Button>
+            <CardTitle>Strategies ({filteredStrategies.length})</CardTitle>
+            <div className="flex items-center gap-3">
+              <select
+                value={filterSource}
+                onChange={(e) => setFilterSource(e.target.value as 'all' | 'LIVE' | 'PAPER')}
+                className="px-3 py-2 text-sm bg-[var(--background)] border border-[var(--border)] rounded-md focus:outline-none"
+              >
+                <option value="all">All Sources</option>
+                <option value="LIVE">Live (Kite)</option>
+                <option value="PAPER">Paper (Simulator)</option>
+              </select>
+              <Button variant="outline" size="sm" onClick={fetchData} disabled={isRefreshing}>
+                <RefreshCw className={`h-4 w-4 mr-1 ${isRefreshing ? 'animate-spin' : ''}`} />
+                Refresh
+              </Button>
+            </div>
           </div>
         </CardHeader>
         <CardContent>
-          {strategies.length === 0 ? (
+          {filteredStrategies.length === 0 ? (
             <div className="text-center py-8 text-[var(--muted-foreground)]">
               No strategies created yet. Go to Positions to create a strategy.
             </div>
           ) : (
             <div className="space-y-4">
-              {strategies.map((strategy) => (
+              {filteredStrategies.map((strategy) => (
                 <div 
                   key={strategy.id} 
                   id={`strategy-${strategy.id}`}
@@ -279,7 +296,7 @@ export function StrategiesPage() {
               {totals && (
                 <div className="mt-4 pt-4 border-t border-[var(--border)] flex justify-between items-center">
                   <span className="text-sm text-[var(--muted-foreground)]">
-                    {strategies.length} strateg{strategies.length !== 1 ? 'ies' : 'y'}
+                    {filteredStrategies.length} strateg{filteredStrategies.length !== 1 ? 'ies' : 'y'}
                   </span>
                   <div className="flex items-center gap-6">
                     <div className="text-right">

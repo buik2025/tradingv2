@@ -14,11 +14,11 @@ export default defineConfig({
   server: {
     proxy: {
       '/api/v1/ws': {
-        target: 'ws://localhost:8173',
+        target: 'ws://localhost:8170',
         ws: true,
       },
       '/api': {
-        target: 'http://localhost:8173',
+        target: 'http://localhost:8170',
         changeOrigin: true,
       },
     },

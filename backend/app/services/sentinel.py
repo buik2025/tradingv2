@@ -15,9 +15,10 @@ from ..config.constants import (
     INTERVAL_5MIN, INTERVAL_DAY, REGIME_LOOKBACK_DAYS
 )
 from ..config.thresholds import (
-    ADX_RANGE_BOUND, ADX_MEAN_REVERSION, ADX_TREND, ADX_CHAOS,
-    RSI_OVERSOLD, RSI_OVERBOUGHT, RSI_NEUTRAL_LOW, RSI_NEUTRAL_HIGH,
-    IV_LOW, IV_HIGH, IV_ENTRY_MIN, IV_LOW_VOL_BONUS,
+    ADX_RANGE_BOUND, ADX_MEAN_REVERSION_MAX, ADX_TREND_MIN,
+    RSI_OVERSOLD, RSI_OVERBOUGHT, RSI_NEUTRAL_MIN, RSI_NEUTRAL_MAX,
+    IV_PERCENTILE_SHORT_VOL, IV_PERCENTILE_STRANGLE, IV_PERCENTILE_CHAOS,
+    IV_HIGH,
     CORRELATION_THRESHOLD, CORRELATION_CHAOS, CORRELATION_INTRA_EQUITY,
     ML_OVERRIDE_PROBABILITY, ML_CHAOS_PROBABILITY, EVENT_BLACKOUT_DAYS,
     MIN_CHAOS_TRIGGERS, MIN_CAUTION_TRIGGERS,
@@ -305,9 +306,9 @@ class Sentinel(BaseAgent):
         # 2. IV percentile > 75%
         confluence.add_trigger(
             name="IV Percentile",
-            triggered=metrics.iv_percentile > IV_HIGH,
+            triggered=metrics.iv_percentile > IV_PERCENTILE_CHAOS,
             value=metrics.iv_percentile,
-            threshold=IV_HIGH,
+            threshold=IV_PERCENTILE_CHAOS,
             direction="above",
             weight=1.5,
             is_chaos=True
@@ -325,12 +326,13 @@ class Sentinel(BaseAgent):
             is_chaos=True
         )
         
-        # 4. ADX > 35 (strong trend/chaos)
+        # 4. Same ADX trigger for chaos (high trend)
+        ADX_CHAOS_LEVEL = 35
         confluence.add_trigger(
             name="ADX Chaos",
-            triggered=metrics.adx > ADX_CHAOS,
+            triggered=metrics.adx > ADX_CHAOS_LEVEL,
             value=metrics.adx,
-            threshold=ADX_CHAOS,
+            threshold=ADX_CHAOS_LEVEL,
             direction="above",
             weight=1.5,
             is_chaos=True
@@ -385,7 +387,7 @@ class Sentinel(BaseAgent):
         )
         
         # 3. Neutral RSI
-        rsi_neutral = RSI_NEUTRAL_LOW <= metrics.rsi <= RSI_NEUTRAL_HIGH
+        rsi_neutral = RSI_NEUTRAL_MIN <= metrics.rsi <= RSI_NEUTRAL_MAX
         confluence.add_trigger(
             name="Neutral RSI",
             triggered=rsi_neutral,
@@ -399,9 +401,9 @@ class Sentinel(BaseAgent):
         # 4. Low IV percentile (bonus for short-vol)
         confluence.add_trigger(
             name="Low IV Bonus",
-            triggered=metrics.iv_percentile < IV_LOW_VOL_BONUS,
+            triggered=metrics.iv_percentile < IV_PERCENTILE_SHORT_VOL,
             value=metrics.iv_percentile,
-            threshold=IV_LOW_VOL_BONUS,
+            threshold=IV_PERCENTILE_SHORT_VOL,
             direction="below",
             weight=1.0,
             is_range=True
@@ -457,20 +459,20 @@ class Sentinel(BaseAgent):
         
         # RANGE_BOUND: Moderate range signals with low IV bonus
         if (metrics.adx < ADX_RANGE_BOUND and 
-            metrics.iv_percentile < IV_LOW and
-            RSI_NEUTRAL_LOW <= metrics.rsi <= RSI_NEUTRAL_HIGH):
+            metrics.iv_percentile < IV_PERCENTILE_SHORT_VOL and
+            RSI_NEUTRAL_MIN <= metrics.rsi <= RSI_NEUTRAL_MAX):
             confidence = 0.75
             return RegimeType.RANGE_BOUND, confidence, confluence
         
         # MEAN_REVERSION: Moderate ADX + extreme RSI
-        if (ADX_RANGE_BOUND <= metrics.adx <= ADX_MEAN_REVERSION and
+        if (ADX_RANGE_BOUND <= metrics.adx <= ADX_MEAN_REVERSION_MAX and
             (metrics.rsi < RSI_OVERSOLD or metrics.rsi > RSI_OVERBOUGHT)):
             confidence = 0.7 + abs(metrics.rsi - 50) / 100
             return RegimeType.MEAN_REVERSION, min(confidence, 0.9), confluence
         
         # TREND: High ADX but not chaos
-        if metrics.adx > ADX_TREND:
-            confidence = min(0.6 + (metrics.adx - ADX_TREND) / 50, 0.85)
+        if metrics.adx > ADX_TREND_MIN:
+            confidence = min(0.6 + (metrics.adx - ADX_TREND_MIN) / 50, 0.85)
             return RegimeType.TREND, confidence, confluence
         
         # Default: MEAN_REVERSION with moderate confidence
@@ -633,7 +635,12 @@ class Sentinel(BaseAgent):
             reasons.append(f"Correlation spike: {max_corr:.2f}")
         
         # Safe if RANGE_BOUND or MEAN_REVERSION with no major issues
-        is_safe = regime in [RegimeType.RANGE_BOUND, RegimeType.MEAN_REVERSION] and not event_flag
+        # TREND is also safe if ADX > 25 (strong trend)
+        safe_regimes = [RegimeType.RANGE_BOUND, RegimeType.MEAN_REVERSION]
+        if regime == RegimeType.TREND and metrics.adx > 25:
+            safe_regimes.append(RegimeType.TREND)
+            
+        is_safe = regime in safe_regimes and not event_flag
         
         return is_safe, reasons
     

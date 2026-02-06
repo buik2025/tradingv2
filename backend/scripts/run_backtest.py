@@ -119,7 +119,7 @@ def main():
         strategies=["iron_condor", "jade_lizard", "butterfly", "naked_strangle"],
         symbol="NIFTY",
         start_date=date(2025, 11, 1),
-        end_date=date(2026, 2, 6),
+        end_date=date(2026, 2, 5),
         max_loss_per_trade=0.015,  # 1.5% - updated per Grok
         max_daily_loss=0.015,      # 1.5% - updated per Grok
     )

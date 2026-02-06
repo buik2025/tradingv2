@@ -99,6 +99,41 @@ class KiteClient:
             logger.error(f"Failed to generate session: {e}")
             raise
     
+    def refresh_session(self) -> bool:
+        """
+        Attempt to refresh session from database credentials.
+        Returns True if successful.
+        """
+        try:
+            # Import here to avoid circular dependency
+            from .credentials import get_kite_credentials
+            
+            creds = get_kite_credentials()
+            if not creds:
+                logger.warning("No credentials found in database during refresh")
+                return False
+                
+            if creds.get('is_expired'):
+                logger.warning("Database credentials are also expired")
+                return False
+                
+            new_token = creds.get('access_token')
+            if not new_token or new_token == self.access_token:
+                logger.info("Database has same token, skipping refresh")
+                return False
+                
+            # Update token
+            self.access_token = new_token
+            if self._kite:
+                self._kite.set_access_token(self.access_token)
+            
+            logger.info(f"Refreshed access token from database (user: {creds.get('user_id')})")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to refresh session: {e}")
+            return False
+
     def _retry_request(self, func, *args, **kwargs) -> Any:
         """Execute a request with retry logic."""
         last_error = None
@@ -106,14 +141,23 @@ class KiteClient:
             try:
                 return func(*args, **kwargs)
             except TokenException as e:
-                # Token expired - don't retry, raise immediately
-                logger.error(f"Token expired or invalid: {e}")
+                # Token expired - try to refresh from DB
+                logger.warning(f"Token expired: {e}. Attempting refresh from DB...")
+                if self.refresh_session():
+                    continue  # Retry with new token
+                
+                logger.error(f"Token refresh failed or token invalid: {e}")
                 raise TokenExpiredException(str(e))
+                
             except Exception as e:
                 error_str = str(e).lower()
                 # Check for token-related errors in message
                 if "api_key" in error_str or "access_token" in error_str or "token" in error_str:
-                    logger.error(f"Token error detected: {e}")
+                    logger.warning(f"Token error detected: {e}. Attempting refresh from DB...")
+                    if self.refresh_session():
+                        continue
+                        
+                    logger.error(f"Token refresh failed: {e}")
                     raise TokenExpiredException(str(e))
                 
                 last_error = e

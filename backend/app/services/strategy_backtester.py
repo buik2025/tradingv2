@@ -632,10 +632,11 @@ class StrategyBacktester:
         iv_pct: float
     ) -> Tuple[RegimeType, float]:
         """Classify regime based on indicators (updated per Grok Feb 5)."""
-        from ..config.thresholds import ADX_RANGE_BOUND, ADX_TREND, ADX_CHAOS, IV_HIGH
+        from ..config.thresholds import ADX_RANGE_BOUND, ADX_TREND_MIN, IV_PERCENTILE_CHAOS
         
         # CHAOS: Very high IV (>75%) AND high ADX (>35)
-        if iv_pct > IV_HIGH and adx > ADX_CHAOS:
+        ADX_CHAOS = 35
+        if iv_pct > IV_PERCENTILE_CHAOS and adx > ADX_CHAOS:
             return RegimeType.CHAOS, 0.85
         
         # RANGE_BOUND: Low ADX (<14), any RSI (relaxed from neutral only)
@@ -643,15 +644,15 @@ class StrategyBacktester:
             return RegimeType.RANGE_BOUND, 0.80
         
         # MEAN_REVERSION: Moderate ADX (14-25), extreme RSI
-        if ADX_RANGE_BOUND <= adx <= ADX_TREND and (rsi < 30 or rsi > 70):
+        if ADX_RANGE_BOUND <= adx <= ADX_TREND_MIN and (rsi < 30 or rsi > 70):
             return RegimeType.MEAN_REVERSION, 0.75
         
         # TREND: High ADX (>25)
-        if adx > ADX_TREND:
+        if adx > ADX_TREND_MIN:
             return RegimeType.TREND, 0.70
         
         # CAUTION: Moderate ADX with neutral RSI
-        if ADX_RANGE_BOUND <= adx <= ADX_TREND:
+        if ADX_RANGE_BOUND <= adx <= ADX_TREND_MIN:
             return RegimeType.CAUTION, 0.60
         
         # Default: RANGE_BOUND (more permissive for trading)
@@ -1058,17 +1059,24 @@ class StrategyBacktester:
         """Close a position and record the trade."""
         position = self._positions.pop(pos_id)
         
-        # Calculate final P&L with order-based costs
-        # Costs are per ORDER (0.07%), not per trade value
-        # Entry = 1 order, Exit = 1 order = 2 orders total
-        from ..config.thresholds import COST_PER_ORDER_PCT
-        
+        # Order-based costs (Realistic Zerodha/NSE model)
         pnl = position.current_pnl
         
-        # Order-based costs: 0.07% per order × 2 orders (entry + exit)
-        # Applied to the notional value (entry_price × lot_size equivalent)
-        notional_value = position.entry_price * 50  # Approximate lot value
-        order_costs = notional_value * COST_PER_ORDER_PCT * 2  # Entry + Exit orders
+        # 1. Brokerage: Flat 20 Rs per order (Entry + Exit = 40)
+        # 2. Charges: ~0.053% of PREMIUM turnover (NSE + STT)
+        
+        flat_brokerage = 40  # 20 entry + 20 exit
+        
+        # Estimate turnover based on max_profit (approx premium collected/paid)
+        # This is a simplification, but much better than Notional on Spot
+        turnover = position.max_profit * 2  # Buy + Sell
+        charges = turnover * 0.00053
+        
+        order_costs = flat_brokerage + charges
+        if position.strategy_type.lower() in ["iron_condor", "jade_lizard"]:
+            # Complex strategies have more legs, so higher brokerage
+            order_costs += 40  # Extra legs
+            
         pnl -= order_costs
         
         # Apply slippage

@@ -26,6 +26,7 @@ export function PortfoliosPage() {
   const [newPortfolioName, setNewPortfolioName] = useState('');
   const [newPortfolioDescription, setNewPortfolioDescription] = useState('');
   const [creating, setCreating] = useState(false);
+  const [filterSource, setFilterSource] = useState<'all' | 'LIVE' | 'PAPER'>('all');
 
   const fetchData = useCallback(async () => {
     setIsRefreshing(true);
@@ -65,21 +66,29 @@ export function PortfoliosPage() {
       return portfolio;
     });
   }, [data?.portfolios, wsPortfolios]);
+
+  const filteredPortfolios = useMemo(() => {
+    if (filterSource === 'all') return portfolios;
+    return portfolios.filter((p) => {
+      const sources = new Set(p.strategies.map((s) => s.source));
+      return sources.has(filterSource);
+    });
+  }, [portfolios, filterSource]);
   
   const account = data?.account;
   
   // Recalculate totals when portfolios update from WebSocket
   const totals = useMemo(() => {
-    if (!portfolios.length) return data?.totals;
-    const totalPnl = portfolios.reduce((sum, p) => sum + p.total_pnl, 0);
-    const totalMargin = portfolios.reduce((sum, p) => sum + p.total_margin, 0);
+    if (!filteredPortfolios.length) return data?.totals;
+    const totalPnl = filteredPortfolios.reduce((sum, p) => sum + p.total_pnl, 0);
+    const totalMargin = filteredPortfolios.reduce((sum, p) => sum + p.total_margin, 0);
     return {
       pnl: totalPnl,
       margin: totalMargin,
       pnl_on_margin_pct: totalMargin > 0 ? (totalPnl / totalMargin * 100) : 0,
-      count: portfolios.length
+      count: filteredPortfolios.length
     };
-  }, [portfolios, data?.totals]);
+  }, [filteredPortfolios, data?.totals]);
 
   const togglePortfolioExpanded = (id: string) => {
     setExpandedPortfolios(prev => {
@@ -167,22 +176,33 @@ export function PortfoliosPage() {
       <Card>
         <CardHeader>
           <div className="flex items-center justify-between">
-            <CardTitle>Portfolios ({portfolios.length})</CardTitle>
-            <Button variant="outline" size="sm" onClick={fetchData} disabled={isRefreshing}>
-              <RefreshCw className={`h-4 w-4 mr-1 ${isRefreshing ? 'animate-spin' : ''}`} />
-              Refresh
-            </Button>
+            <CardTitle>Portfolios ({filteredPortfolios.length})</CardTitle>
+            <div className="flex items-center gap-3">
+              <select
+                value={filterSource}
+                onChange={(e) => setFilterSource(e.target.value as 'all' | 'LIVE' | 'PAPER')}
+                className="px-3 py-2 text-sm bg-[var(--background)] border border-[var(--border)] rounded-md focus:outline-none"
+              >
+                <option value="all">All Sources</option>
+                <option value="LIVE">Live (Kite)</option>
+                <option value="PAPER">Paper (Simulator)</option>
+              </select>
+              <Button variant="outline" size="sm" onClick={fetchData} disabled={isRefreshing}>
+                <RefreshCw className={`h-4 w-4 mr-1 ${isRefreshing ? 'animate-spin' : ''}`} />
+                Refresh
+              </Button>
+            </div>
           </div>
         </CardHeader>
         <CardContent>
-          {portfolios.length === 0 ? (
+          {filteredPortfolios.length === 0 ? (
             <div className="text-center py-8 text-[var(--muted-foreground)]">
               <FolderOpen className="h-12 w-12 mx-auto mb-4 opacity-50" />
               <p>No portfolios yet. Create one to organize your strategies.</p>
             </div>
           ) : (
             <div className="space-y-4">
-              {portfolios.map((portfolio) => (
+              {filteredPortfolios.map((portfolio) => (
                 <div key={portfolio.id} className="border border-[var(--border)] rounded-lg overflow-hidden">
                   {/* Portfolio Header */}
                   <div 
@@ -277,7 +297,7 @@ export function PortfoliosPage() {
               {totals && (
                 <div className="mt-4 pt-4 border-t border-[var(--border)] flex justify-between items-center">
                   <span className="text-sm text-[var(--muted-foreground)]">
-                    {portfolios.length} portfolio{portfolios.length !== 1 ? 's' : ''}
+                    {filteredPortfolios.length} portfolio{filteredPortfolios.length !== 1 ? 's' : ''}
                   </span>
                   <div className="flex items-center gap-6">
                     <div className="text-right">

@@ -1,23 +1,20 @@
 """Regime detection and risk thresholds for Trading System v2.0"""
 
-# Regime Detection Thresholds (Revised per Feb 5 2026 analysis)
-ADX_RANGE_BOUND = 14       # ADX < 14 = Range-bound (raised from 12 per Grok Feb 5)
-ADX_MEAN_REVERSION = 25    # ADX 12-25 = Mean-reversion zone (mild/noisy trends)
-ADX_TREND = 25             # ADX > 25 = Trend (raised from 22)
-ADX_CHAOS = 35             # ADX > 35 + vol spike = Chaos
+# Regime Detection Thresholds (Revised per Grok Feb 5 2026 analysis)
+ADX_RANGE_BOUND = 12       # ADX < 12 = Range-bound (lowered from 14 for safety)
+ADX_MEAN_REVERSION_MAX = 25    # ADX 12-25 = Mean-reversion
+ADX_TREND_MIN = 25             # ADX > 25 = Trend
 
-RSI_OVERSOLD = 30          # RSI < 30 = Oversold
-RSI_OVERBOUGHT = 70        # RSI > 70 = Overbought
-RSI_NEUTRAL_LOW = 40       # RSI 40-60 = Neutral
-RSI_NEUTRAL_HIGH = 60
-RSI_EXTREME_LOW = 25       # RSI < 25 = Strong oversold for reversion
-RSI_EXTREME_HIGH = 75      # RSI > 75 = Strong overbought for reversion
+RSI_NEUTRAL_MIN = 35       # RSI 35-65 = Neutral (widened from 40-60)
+RSI_NEUTRAL_MAX = 65
+RSI_OVERSOLD = 35          # RSI < 35 = Oversold signal
+RSI_OVERBOUGHT = 65        # RSI > 65 = Overbought signal
 
 # IV Thresholds
-IV_LOW = 35                # IV percentile < 35% = Low vol
-IV_HIGH = 75               # IV percentile > 75% = High vol / Chaos
-IV_ENTRY_MIN = 45          # Minimum IV for short-vol entries (loosened from 40 per Grok Feb 5)
-IV_LOW_VOL_BONUS = 25      # IV < 25% = Override mild ADX/corr triggers
+IV_PERCENTILE_SHORT_VOL = 35   # IV < 35% = Short vol allowed (lowered from 40%)
+IV_PERCENTILE_STRANGLE = 15    # IV < 15% = Ultra-low vol (Strangle zone)
+IV_PERCENTILE_CHAOS = 75       # IV > 75% = Chaos exclusion
+IV_HIGH = 70                     # IV > 70% = High Volatility (Safety check)
 
 # Correlation Thresholds (Differentiated by asset type)
 CORRELATION_THRESHOLD = 0.4      # |corr| > 0.4 = Disable secondary
@@ -80,8 +77,20 @@ IC_LONG_DELTA = 15             # Long strikes at 15-delta
 IC_PROFIT_TARGET = 0.60        # Exit at 60% of max profit
 IC_STOP_LOSS = 1.0             # Stop at 100% of credit (loss = credit)
 IC_MIN_DTE = 10                # Minimum days to expiry for entry
-IC_MAX_DTE = 12                # Maximum days to expiry for entry
+IC_MAX_DTE = 45                # Max DTE (widened for monthly)
 IC_EXIT_DTE = 5                # Mandatory exit at T-5
+
+# Strangle Strategy (Per tradingv2.md)
+STRANGLE_DELTA_TARGET = 0.30   # Target delta for strangles
+STRANGLE_PROFIT_TARGET = 0.008 # 0.8% of margin (min)
+STRANGLE_PROFIT_TARGET_MAX = 0.01 # 1% of margin (max)
+
+# Risk Reversal Parameters (New)
+RR_DELTA_TARGET = 0.25         # 25-delta for directional
+RR_PROFIT_TARGET_MIN = 0.014   # 1.4% of margin
+RR_PROFIT_TARGET_MAX = 0.022   # 2.2% of margin
+RR_STOP_LOSS_MIN = 0.008       # 0.8% of margin
+RR_STOP_LOSS_MAX = 0.012       # 1.2% of margin
 
 # Entry Conditions
 MAX_PREV_DAY_RANGE = 0.012     # Previous day range < 1.2%

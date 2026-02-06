@@ -138,53 +138,53 @@ class RiskReversalStrategy:
         spot: float,
         direction: str
     ) -> Optional[Tuple[float, float]]:
-        """Select strikes for Risk Reversal based on delta (~0.15)."""
+        """Select strikes for Risk Reversal based on delta (~0.25)."""
         if option_chain.empty:
             return None
         
-        # Target delta for risk reversal: ~0.15
-        target_delta = 0.15
+        # Target delta for risk reversal: 0.25 (directional)
+        target_delta = 0.25
         
         short_strike = None
         long_strike = None
         
         if direction == "BULLISH":
-            # Short put with delta ~-0.15 (absolute 0.15)
+            # Short put with delta ~-0.25 (absolute 0.25)
             put_delta_diff = float('inf')
             for _, row in option_chain[option_chain['instrument_type'] == 'PE'].iterrows():
                 delta = row.get('delta', 0)
-                if delta < -0.13 and delta > -0.18:  # OTM put delta range
+                if delta < -0.20 and delta > -0.30:  # OTM put delta range
                     diff = abs(delta + target_delta)  # delta is negative for puts
                     if diff < put_delta_diff:
                         put_delta_diff = diff
                         short_strike = row['strike']
             
-            # Long call with delta ~0.15
+            # Long call with delta ~0.25
             call_delta_diff = float('inf')
             for _, row in option_chain[option_chain['instrument_type'] == 'CE'].iterrows():
                 delta = row.get('delta', 0)
-                if delta > 0.13 and delta < 0.18:  # OTM call delta range
+                if delta > 0.20 and delta < 0.30:  # OTM call delta range
                     diff = abs(delta - target_delta)
                     if diff < call_delta_diff:
                         call_delta_diff = diff
                         long_strike = row['strike']
         
         else:  # BEARISH
-            # Short call with delta ~0.15
+            # Short call with delta ~0.25
             call_delta_diff = float('inf')
             for _, row in option_chain[option_chain['instrument_type'] == 'CE'].iterrows():
                 delta = row.get('delta', 0)
-                if delta > 0.13 and delta < 0.18:  # OTM call delta range
+                if delta > 0.20 and delta < 0.30:  # OTM call delta range
                     diff = abs(delta - target_delta)
                     if diff < call_delta_diff:
                         call_delta_diff = diff
                         short_strike = row['strike']
             
-            # Long put with delta ~-0.15 (absolute 0.15)
+            # Long put with delta ~-0.25 (absolute 0.25)
             put_delta_diff = float('inf')
             for _, row in option_chain[option_chain['instrument_type'] == 'PE'].iterrows():
                 delta = row.get('delta', 0)
-                if delta < -0.13 and delta > -0.18:  # OTM put delta range
+                if delta < -0.20 and delta > -0.30:  # OTM put delta range
                     diff = abs(delta + target_delta)  # delta is negative for puts
                     if diff < put_delta_diff:
                         put_delta_diff = diff

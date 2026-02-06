@@ -454,19 +454,30 @@ async def websocket_endpoint(websocket: WebSocket):
     connected = True
     positions = []
     
+    # Get the current event loop for thread-safe scheduling
+    loop = asyncio.get_running_loop()
+    
     def on_tick(ticks):
-        """Callback when ticks arrive from Kite."""
+        """Callback when ticks arrive from Kite (runs in separate thread)."""
         if not connected:
             return
+        
+        def _put_tick():
+            try:
+                # Drop old ticks if queue is full
+                if tick_queue.full():
+                    try:
+                        tick_queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        pass
+                tick_queue.put_nowait(ticks)
+            except Exception:
+                pass
+
+        # Schedule the queue update on the main event loop
         try:
-            # Drop old ticks if queue is full (we only care about latest)
-            if tick_queue.full():
-                try:
-                    tick_queue.get_nowait()
-                except:
-                    pass
-            tick_queue.put_nowait(ticks)
-        except:
+            loop.call_soon_threadsafe(_put_tick)
+        except Exception:
             pass
     
     async def send_heartbeat():

@@ -8,7 +8,7 @@ from loguru import logger
 from ..models.regime import RegimePacket, RegimeType
 from ..models.trade import TradeProposal, TradeLeg, LegType, StructureType
 from ..config.thresholds import (
-    IV_ENTRY_MIN, IC_SHORT_DELTA, IC_LONG_DELTA,
+    IV_PERCENTILE_SHORT_VOL, IC_SHORT_DELTA, IC_LONG_DELTA,
     IC_PROFIT_TARGET, IC_STOP_LOSS, IC_MIN_DTE, IC_MAX_DTE,
     MAX_PREV_DAY_RANGE, MAX_GAP_PCT, MIN_BID_ASK_SPREAD, MIN_OPEN_INTEREST
 )
@@ -57,8 +57,9 @@ class IronCondorStrategy:
             return False, f"Regime not safe: {regime.safety_reasons}"
         
         # IV check
-        if regime.metrics.iv_percentile < IV_ENTRY_MIN:
-            return False, f"IV too low: {regime.metrics.iv_percentile:.1f}% < {IV_ENTRY_MIN}%"
+        # IV check (>35% is acceptable for IC)
+        if regime.metrics.iv_percentile < IV_PERCENTILE_SHORT_VOL:
+            return False, f"IV too low: {regime.metrics.iv_percentile:.1f}% < {IV_PERCENTILE_SHORT_VOL}%"
         
         # Event check
         if regime.event_flag:

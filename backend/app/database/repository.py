@@ -107,6 +107,20 @@ class Repository:
         with self._get_session() as session:
             return session.query(PositionRecord).filter_by(status="OPEN").all()
     
+    def get_open_broker_positions(self, source: str = None) -> List[BrokerPosition]:
+        """Get open broker positions, optionally filtered by source."""
+        with self._get_session() as session:
+            query = session.query(BrokerPosition).filter(BrokerPosition.quantity != 0)
+            if source:
+                query = query.filter(BrokerPosition.source == source)
+            return query.all()
+    
+    def save_broker_position(self, position: BrokerPosition) -> None:
+        """Save a broker position."""
+        with self._get_session() as session:
+            session.merge(position)
+            session.commit()
+            
     def close_position(
         self,
         position_id: str,

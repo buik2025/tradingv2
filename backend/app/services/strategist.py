@@ -14,10 +14,12 @@ from ..config.constants import (
     NFO, BUY, SELL
 )
 from ..config.thresholds import (
-    IV_ENTRY_MIN, IC_SHORT_DELTA, IC_LONG_DELTA,
+    IV_PERCENTILE_SHORT_VOL, IV_PERCENTILE_STRANGLE,
+    IC_SHORT_DELTA, IC_LONG_DELTA,
     IC_PROFIT_TARGET, IC_STOP_LOSS, IC_MIN_DTE, IC_MAX_DTE,
     MAX_PREV_DAY_RANGE, MAX_GAP_PCT, EVENT_BLACKOUT_DAYS,
-    MIN_BID_ASK_SPREAD, MIN_OPEN_INTEREST
+    MIN_BID_ASK_SPREAD, MIN_OPEN_INTEREST,
+    RSI_OVERSOLD, RSI_OVERBOUGHT
 )
 from ..models.regime import RegimePacket, RegimeType
 from ..models.trade import TradeProposal, TradeLeg, LegType, StructureType
@@ -26,6 +28,11 @@ from .jade_lizard import JadeLizardStrategy
 from .butterfly import ButterflyStrategy, BrokenWingButterflyStrategy
 from .risk_reversal import RiskReversalStrategy
 from .strangle import StrangleStrategy
+from .technical import (
+    calculate_adx, calculate_rsi, calculate_atr, calculate_day_range,
+    calculate_bollinger_band_width, calculate_bbw_ratio, calculate_volume_ratio
+)
+from .greeks import validate_and_calculate_greeks, GreeksCalculator
 
 
 class Strategist(BaseAgent):
@@ -45,15 +52,20 @@ class Strategist(BaseAgent):
         super().__init__(kite, config, name="Strategist")
         self._expiry_cache: Dict[str, List[date]] = {}
         
+        # Initialize Greeks calculator
+        self._greeks_calculator = GreeksCalculator()
+        
         # Initialize strategy modules
         self._jade_lizard = JadeLizardStrategy(lot_size=50)
         self._butterfly = ButterflyStrategy(lot_size=50)
         self._bwb = BrokenWingButterflyStrategy(lot_size=50)
+        self._bwb = BrokenWingButterflyStrategy(lot_size=50)
         self._strangle = StrangleStrategy(self.kite)
+        self._risk_reversal = RiskReversalStrategy(self.kite)
         
         # Filter enabled strategies
         self.enabled_strategies = enabled_strategies or [
-            "iron_condor", "jade_lizard", "butterfly", "naked_strangle"
+            "iron_condor", "jade_lizard", "butterfly", "naked_strangle", "risk_reversal"
         ]
     
     def process(self, regime_packet: RegimePacket) -> List[TradeProposal]:
@@ -93,51 +105,51 @@ class Strategist(BaseAgent):
                 proposals.append(jl_proposal)
             return proposals
         
-        # RANGE_BOUND - multiple short-vol strategies
-        if regime_packet.allows_short_vol():
-            self.logger.info("RANGE_BOUND - generating short-vol signals")
+        # RANGE_BOUND - Strangles (primary) or Iron Condors (secondary)
+        if regime_packet.regime == RegimeType.RANGE_BOUND:
+            self.logger.info("RANGE_BOUND - Checking for Strangle/IC")
             
-            # Iron Condor (primary)
-            if "iron_condor" in self.enabled_strategies:
-                ic_proposal = self._generate_iron_condor(regime_packet)
-                if ic_proposal:
-                    proposals.append(ic_proposal)
-            
-            # Butterfly (if high confidence and low BBW)
-            if "butterfly" in self.enabled_strategies:
-                bf_proposal = self._generate_butterfly(regime_packet)
-                if bf_proposal:
-                    proposals.append(bf_proposal)
-            
-            # Jade Lizard (if IV > 35%)
-            if "jade_lizard" in self.enabled_strategies:
-                jl_proposal = self._generate_jade_lizard(regime_packet)
-                if jl_proposal:
-                    proposals.append(jl_proposal)
-            
-            # Strangle (if IV is elevated)
-            if "naked_strangle" in self.enabled_strategies and regime_packet.metrics.iv_percentile > IV_ENTRY_MIN:
+            # 1. Strangle (if low IV and enabled)
+            if "naked_strangle" in self.enabled_strategies:
+                # _generate_strangle checks suitability internally (IV < 15% or < 35%)
                 strangle_proposal = self._generate_strangle(regime_packet)
                 if strangle_proposal:
                     proposals.append(strangle_proposal)
-        
-        # MEAN_REVERSION - directional strategies
-        elif regime_packet.allows_directional():
-            self.logger.info("MEAN_REVERSION - generating directional signals")
             
-            # Broken Wing Butterfly
-            bwb_proposal = self._generate_bwb(regime_packet)
-            if bwb_proposal:
-                proposals.append(bwb_proposal)
+            # 2. Iron Condor (Safety fallback or if strangle invalid)
+            # Only add if no strangle found, or we want diversity
+            if not proposals and "iron_condor" in self.enabled_strategies:
+                 ic_proposal = self._generate_iron_condor(regime_packet)
+                 if ic_proposal:
+                     proposals.append(ic_proposal)
+                     
+        # MEAN_REVERSION - Risk Reversal (primary directional) or Strangle (neutral)
+        elif regime_packet.regime == RegimeType.MEAN_REVERSION:
+            self.logger.info("MEAN_REVERSION - Checking for Risk Reversal/Strangle")
+            
+            rsi = regime_packet.metrics.rsi
+            
+            # Dynamic RSI thresholds logic handled in RiskReversalStrategy
+            # Check for directional plays first
+            if "risk_reversal" in self.enabled_strategies:
+                rr_proposal = self._generate_risk_reversal(regime_packet)
+                if rr_proposal:
+                    proposals.append(rr_proposal)
+            
+            # If no directional play, check for neutral Theta play (Strangle)
+            # Only if RSI is neutral (35-65) and no RR generated
+            if not proposals and "naked_strangle" in self.enabled_strategies:
+                 strangle_proposal = self._generate_strangle(regime_packet)
+                 if strangle_proposal:
+                     proposals.append(strangle_proposal)
         
-        # TREND - directional strategies
+        # TREND - Risk Reversal (directional)
         elif regime_packet.regime == RegimeType.TREND:
-            self.logger.info("TREND regime - generating directional signals")
-            
-            # Risk Reversal for directional moves
-            # rr_proposal = self._generate_risk_reversal(regime_packet)
-            # if rr_proposal:
-            #     proposals.append(rr_proposal)
+             self.logger.info("TREND regime - Checking for Risk Reversal")
+             if "risk_reversal" in self.enabled_strategies:
+                 rr_proposal = self._generate_risk_reversal(regime_packet)
+                 if rr_proposal:
+                     proposals.append(rr_proposal)
         
         else:
             self.logger.debug(f"No signals for regime: {regime_packet.regime}")
@@ -200,7 +212,71 @@ class Strategist(BaseAgent):
         if option_chain.empty:
             return None
         
-        return self._strangle.generate_proposal(regime, option_chain, expiry)
+        proposal = self._strangle.generate_proposal(regime, option_chain, expiry)
+        if not proposal:
+            return None
+            
+        # Validate Greeks
+        strikes = [leg.strike for leg in proposal.legs]
+        if not self._validate_greeks(option_chain, strikes):
+            return None
+            
+        return proposal
+    
+    def _generate_risk_reversal(self, regime: RegimePacket) -> Optional[TradeProposal]:
+        """Generate Risk Reversal proposal using strategy module."""
+        symbol = regime.symbol
+        # Directional plays usually target 30-45 DTE
+        expiry = self._get_target_expiry(symbol, 25, 45)
+        if not expiry:
+            return None
+            
+        option_chain = self.kite.get_option_chain(symbol, expiry)
+        if option_chain.empty:
+            return None
+            
+        proposal = self._risk_reversal.generate_proposal(regime, option_chain, expiry)
+        if not proposal:
+            return None
+            
+        # Validate Greeks
+        strikes = [leg.strike for leg in proposal.legs]
+        if not self._validate_greeks(option_chain, strikes):
+            return None
+            
+        return proposal
+    
+    def _validate_greeks(self, option_chain: pd.DataFrame, selected_strikes: List[float]) -> bool:
+        """Validate that calculated Greeks match expected ranges."""
+        
+        for strike in selected_strikes:
+            # Check if strike exists in chain
+            if strike not in option_chain['strike'].values:
+                continue
+                
+            # Get option rows (call and put) - simplified, just check any
+            rows = option_chain[option_chain['strike'] == strike]
+            if rows.empty:
+                continue
+                
+            row = rows.iloc[0]
+            
+            # Check delta is reasonable (not > 1 or < -1)
+            delta = row.get('delta', 0)
+            if abs(delta) > 1.0:
+                self.logger.warning(f"Invalid delta {delta} for strike {strike}")
+                return False
+            
+            # Check theta exists (should be negative for longs in our context if we cared, 
+            # but usually we sell. Actually, theta is negative for long options.
+            # Short options have positive theta. Just check it's not zero/None if LTP > 0)
+            theta = row.get('theta', 0)
+            ltp = row.get('ltp', 0)
+            if ltp > 5 and theta == 0:
+                self.logger.warning(f"Theta missing for strike {strike} despite LTP {ltp}")
+                return False
+                
+        return True
     
     def _is_entry_window(self) -> bool:
         """Check if current time is within entry window."""
@@ -208,7 +284,7 @@ class Strategist(BaseAgent):
         start = time(ENTRY_START_HOUR, ENTRY_START_MINUTE)
         end = time(ENTRY_END_HOUR, ENTRY_END_MINUTE)
         return start <= now <= end
-    
+
     def _generate_iron_condor(self, regime: RegimePacket) -> Optional[TradeProposal]:
         """
         Generate Iron Condor trade proposal.
@@ -238,10 +314,14 @@ class Strategist(BaseAgent):
             return None
         
         # Find strikes
-        spot = regime.spot_price
-        strikes = self._select_ic_strikes(option_chain, spot)
+        # Select strikes
+        strikes = self._select_ic_strikes(option_chain, regime.spot_price)
         if not strikes:
             self.logger.warning("Could not select strikes")
+            return None
+            
+        if not self._validate_greeks(option_chain, list(strikes)):
+            self.logger.warning("Greeks validation failed for selected IC strikes")
             return None
         
         short_call_strike, short_put_strike, long_call_strike, long_put_strike = strikes
@@ -322,7 +402,7 @@ class Strategist(BaseAgent):
             return False
         
         # IV check
-        if regime.metrics.iv_percentile < IV_ENTRY_MIN:
+        if regime.metrics.iv_percentile < IV_PERCENTILE_SHORT_VOL:
             self.logger.debug(f"IV too low: {regime.metrics.iv_percentile}")
             return False
         
@@ -433,10 +513,22 @@ class Strategist(BaseAgent):
         
         # Validate strikes exist
         available_strikes = set(option_chain['strike'].unique())
+        
+        # Check if long call strike exists, otherwise find the highest available
         if long_call_strike not in available_strikes:
-            long_call_strike = max(s for s in available_strikes if s > short_call_strike)
+            higher_strikes = [s for s in available_strikes if s > short_call_strike]
+            if not higher_strikes:
+                self.logger.warning(f"No strikes available above short call {short_call_strike}, skipping IC")
+                return None
+            long_call_strike = max(higher_strikes)
+        
+        # Check if long put strike exists, otherwise find the lowest available
         if long_put_strike not in available_strikes:
-            long_put_strike = min(s for s in available_strikes if s < short_put_strike)
+            lower_strikes = [s for s in available_strikes if s < short_put_strike]
+            if not lower_strikes:
+                self.logger.warning(f"No strikes available below short put {short_put_strike}, skipping IC")
+                return None
+            long_put_strike = min(lower_strikes)
         
         return short_call_strike, short_put_strike, long_call_strike, long_put_strike
     
@@ -491,10 +583,18 @@ class Strategist(BaseAgent):
         short_call_strike, short_put_strike, long_call_strike, long_put_strike = strikes
         legs = []
         
+        # Get spot price from option chain if available
+        spot_price = None
+        if 'underlying_price' in option_chain.columns:
+            spot_price = option_chain['underlying_price'].iloc[0]
+        elif not option_chain.empty:
+            # Estimate from ATM strike
+            spot_price = (short_call_strike + short_put_strike) / 2
+        
         # Short Call
         short_call = self._build_leg(
             option_chain, short_call_strike, 'CE', expiry,
-            LegType.SHORT_CALL, quantity=50  # NIFTY lot size
+            LegType.SHORT_CALL, quantity=50, spot_price=spot_price  # NIFTY lot size
         )
         if short_call:
             legs.append(short_call)
@@ -502,7 +602,7 @@ class Strategist(BaseAgent):
         # Short Put
         short_put = self._build_leg(
             option_chain, short_put_strike, 'PE', expiry,
-            LegType.SHORT_PUT, quantity=50
+            LegType.SHORT_PUT, quantity=50, spot_price=spot_price
         )
         if short_put:
             legs.append(short_put)
@@ -510,7 +610,7 @@ class Strategist(BaseAgent):
         # Long Call
         long_call = self._build_leg(
             option_chain, long_call_strike, 'CE', expiry,
-            LegType.LONG_CALL, quantity=50
+            LegType.LONG_CALL, quantity=50, spot_price=spot_price
         )
         if long_call:
             legs.append(long_call)
@@ -518,7 +618,7 @@ class Strategist(BaseAgent):
         # Long Put
         long_put = self._build_leg(
             option_chain, long_put_strike, 'PE', expiry,
-            LegType.LONG_PUT, quantity=50
+            LegType.LONG_PUT, quantity=50, spot_price=spot_price
         )
         if long_put:
             legs.append(long_put)
@@ -532,9 +632,10 @@ class Strategist(BaseAgent):
         option_type: str,
         expiry: date,
         leg_type: LegType,
-        quantity: int
+        quantity: int,
+        spot_price: Optional[float] = None
     ) -> Optional[TradeLeg]:
-        """Build a single trade leg."""
+        """Build a single trade leg with validated/calculated Greeks."""
         # Find the option in chain
         mask = (
             (option_chain['strike'] == strike) &
@@ -547,6 +648,34 @@ class Strategist(BaseAgent):
         
         opt = options.iloc[0]
         
+        # Get Greeks from chain (if available)
+        chain_greeks = {
+            'delta': opt.get('delta'),
+            'gamma': opt.get('gamma'),
+            'theta': opt.get('theta'),
+            'vega': opt.get('vega')
+        }
+        
+        # Get IV from chain or estimate
+        iv = opt.get('iv', 0.20)  # Default to 20% if not available
+        if iv is None or iv <= 0:
+            iv = 0.20
+        
+        # Validate or calculate Greeks
+        if spot_price is None:
+            # Try to infer from option chain
+            spot_price = opt.get('underlying_price', strike)
+        
+        greeks = validate_and_calculate_greeks(
+            spot_price=spot_price,
+            strike=strike,
+            expiry_date=expiry,
+            volatility=iv,
+            option_type=option_type,
+            chain_greeks=chain_greeks,
+            calculator=self._greeks_calculator
+        )
+        
         return TradeLeg(
             leg_type=leg_type,
             tradingsymbol=opt.get('tradingsymbol', f"NIFTY{expiry.strftime('%y%b').upper()}{int(strike)}{option_type}"),
@@ -557,10 +686,10 @@ class Strategist(BaseAgent):
             option_type=option_type,
             quantity=quantity,
             entry_price=float(opt.get('ltp', 0)),
-            delta=float(opt.get('delta', 0.25 if option_type == 'CE' else -0.25)),
-            gamma=float(opt.get('gamma', 0.01)),
-            theta=float(opt.get('theta', -5)),
-            vega=float(opt.get('vega', 10))
+            delta=greeks['delta'],
+            gamma=greeks['gamma'],
+            theta=greeks['theta'],
+            vega=greeks['vega']
         )
     
     def _validate_liquidity(
