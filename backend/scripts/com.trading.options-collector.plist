@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.trading.options-collector</string>
+    
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/python3</string>
+        <string>/Users/vwe/Work/experiments/tradingv2/backend/scripts/collect_options_data.py</string>
+        <string>--symbols</string>
+        <string>NIFTY,BANKNIFTY</string>
+        <string>--interval</string>
+        <string>60</string>
+    </array>
+    
+    <key>WorkingDirectory</key>
+    <string>/Users/vwe/Work/experiments/tradingv2/backend</string>
+    
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PYTHONPATH</key>
+        <string>/Users/vwe/Work/experiments/tradingv2/backend</string>
+    </dict>
+    
+    <key>StandardOutPath</key>
+    <string>/Users/vwe/Work/experiments/tradingv2/backend/logs/collector.log</string>
+    
+    <key>StandardErrorPath</key>
+    <string>/Users/vwe/Work/experiments/tradingv2/backend/logs/collector_error.log</string>
+    
+    <key>RunAtLoad</key>
+    <false/>
+    
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+    
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>9</integer>
+        <key>Minute</key>
+        <integer>10</integer>
+    </dict>
+</dict>
+</plist>

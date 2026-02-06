@@ -10,6 +10,8 @@ from .api.routes import router
 from .api.auth import router as auth_router
 from .api.websocket import router as ws_router
 from .api.portfolio_routes import router as portfolio_router
+from .api.backtest_routes import router as backtest_router
+from .api.data_routes import router as data_router
 from .core.logger import setup_logger
 
 
@@ -44,6 +46,8 @@ app.include_router(router, prefix="/api/v1")
 app.include_router(auth_router, prefix="/api/v1")
 app.include_router(ws_router, prefix="/api/v1")
 app.include_router(portfolio_router, prefix="/api/v1")
+app.include_router(backtest_router, prefix="/api/v1")
+app.include_router(data_router, prefix="/api/v1")
 
 
 @app.get("/")

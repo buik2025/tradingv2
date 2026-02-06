@@ -20,25 +20,14 @@ class Repository:
     Handles all database operations.
     """
     
-    def __init__(self, db_url: str = None, db_path: Path = None):
+    def __init__(self, db_url: str = None):
         """
-        Initialize repository with PostgreSQL or SQLite.
+        Initialize repository with PostgreSQL.
         
         Args:
-            db_url: PostgreSQL connection URL (preferred)
-            db_path: SQLite file path (legacy fallback)
+            db_url: PostgreSQL connection URL
         """
-        if db_url:
-            self.db_url = db_url
-            self.db_path = None
-        elif db_path:
-            self.db_path = db_path
-            self.db_path.parent.mkdir(parents=True, exist_ok=True)
-            self.db_url = f"sqlite:///{db_path}"
-        else:
-            # Default to PostgreSQL
-            self.db_url = DATABASE_URL
-            self.db_path = None
+        self.db_url = db_url or DATABASE_URL
         
         self.engine = create_engine(self.db_url)
         Base.metadata.create_all(self.engine)
@@ -225,10 +214,9 @@ class Repository:
     
     # Utility methods
     def backup(self, backup_path: Path) -> None:
-        """Create a backup of the database."""
-        import shutil
-        shutil.copy(self.db_path, backup_path)
-        logger.info(f"Database backed up to {backup_path}")
+        """Create a backup of the database (PostgreSQL - use pg_dump instead)."""
+        logger.warning("For PostgreSQL backup, use pg_dump command instead")
+        # pg_dump -h localhost -U postgres -d trading > backup.sql
     
     def get_db_stats(self) -> Dict[str, int]:
         """Get database statistics."""

@@ -5,7 +5,9 @@ import {
   Layers,
   FolderOpen,
   ClipboardList, 
-  FlaskConical, 
+  FlaskConical,
+  Database,
+  User,
   Settings,
   TrendingUp
 } from 'lucide-react';
@@ -18,6 +20,8 @@ const navItems = [
   { to: '/dashboard/portfolios', icon: FolderOpen, label: 'Portfolios' },
   { to: '/dashboard/orders', icon: ClipboardList, label: 'Orders' },
   { to: '/dashboard/backtest', icon: FlaskConical, label: 'Backtest' },
+  { to: '/dashboard/data', icon: Database, label: 'Data' },
+  { to: '/dashboard/profile', icon: User, label: 'Profile' },
   { to: '/dashboard/settings', icon: Settings, label: 'Settings' },
 ];
 

@@ -20,6 +20,31 @@ DATABASE_URL = os.getenv(
 )
 
 
+class KiteCredentials(Base):
+    """Store Kite API credentials - only keeps latest record."""
+    __tablename__ = "kite_credentials"
+    
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    
+    # Credentials
+    api_key = Column(String(50), nullable=False)
+    api_secret = Column(String(50), nullable=False)
+    access_token = Column(String(100), nullable=False)
+    
+    # User info from Kite
+    user_id = Column(String(50))
+    user_name = Column(String(100))
+    email = Column(String(100))
+    broker = Column(String(20), default="ZERODHA")
+    
+    # Timestamps
+    created_at = Column(DateTime, default=datetime.now)
+    expires_at = Column(DateTime)  # Kite tokens expire at 6 AM next day
+    
+    # Status
+    is_valid = Column(Boolean, default=True)
+
+
 class TradeRecord(Base):
     """Record of completed trades."""
     __tablename__ = "trades"

@@ -7,6 +7,7 @@ from loguru import logger
 
 from ..config.settings import Settings
 from ..core.kite_client import KiteClient
+from ..core.credentials import save_kite_credentials, get_kite_credentials
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -61,7 +62,18 @@ async def auth_callback(request: CallbackRequest, response: Response):
         # Get user profile
         user_data = session_data.get("user", {})
         
-        # Store session
+        # Save credentials to PostgreSQL for use by scripts
+        save_kite_credentials(
+            api_key=config.kite_api_key,
+            api_secret=config.kite_api_secret,
+            access_token=access_token,
+            user_id=user_data.get("user_id"),
+            user_name=user_data.get("user_name"),
+            email=user_data.get("email")
+        )
+        logger.info(f"Saved Kite credentials to database for user: {user_data.get('user_id')}")
+        
+        # Store session in memory
         session_id = f"session_{user_data.get('user_id', 'unknown')}"
         _sessions[session_id] = {
             "access_token": access_token,
@@ -134,8 +146,42 @@ def get_access_token(request: Request) -> Optional[str]:
 
 def get_any_valid_access_token() -> Optional[str]:
     """Get access token from any active session (for WebSocket use)."""
+    # First try in-memory sessions
     for session_id, session_data in _sessions.items():
         token = session_data.get("access_token")
         if token:
             return token
+    
+    # Fall back to database credentials
+    creds = get_kite_credentials()
+    if creds and not creds.get("is_expired"):
+        return creds.get("access_token")
+    
     return None
+
+
+@router.get("/credentials")
+async def get_credentials_status(request: Request):
+    """Get current Kite credentials status from database."""
+    creds = get_kite_credentials()
+    
+    if not creds:
+        return {
+            "has_credentials": False,
+            "message": "No credentials found. Please login with Kite."
+        }
+    
+    # Don't expose the actual tokens, just metadata
+    return {
+        "has_credentials": True,
+        "user_id": creds.get("user_id"),
+        "user_name": creds.get("user_name"),
+        "email": creds.get("email"),
+        "broker": creds.get("broker"),
+        "created_at": creds.get("created_at"),
+        "expires_at": creds.get("expires_at"),
+        "is_valid": creds.get("is_valid"),
+        "is_expired": creds.get("is_expired"),
+        "api_key_masked": creds.get("api_key", "")[:4] + "****" if creds.get("api_key") else None,
+        "access_token_masked": creds.get("access_token", "")[:8] + "****" if creds.get("access_token") else None
+    }

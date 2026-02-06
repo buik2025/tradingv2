@@ -11,7 +11,9 @@ import { PositionsPage } from '@/pages/PositionsPage';
 import { StrategiesPage } from '@/pages/StrategiesPage';
 import { PortfoliosPage } from '@/pages/PortfoliosPage';
 import { Orders } from '@/pages/Orders';
-import { Backtest } from '@/pages/Backtest';
+import { BacktestPage } from '@/pages/BacktestPage';
+import { DataManagementPage } from '@/pages/DataManagementPage';
+import { ProfilePage } from '@/pages/ProfilePage';
 import { Settings } from '@/pages/Settings';
 
 const queryClient = new QueryClient();
@@ -40,7 +42,9 @@ function AppContent() {
         <Route path="strategies" element={<StrategiesPage />} />
         <Route path="portfolios" element={<PortfoliosPage />} />
         <Route path="orders" element={<Orders />} />
-        <Route path="backtest" element={<Backtest />} />
+        <Route path="backtest" element={<BacktestPage />} />
+        <Route path="data" element={<DataManagementPage />} />
+        <Route path="profile" element={<ProfilePage />} />
         <Route path="settings" element={<Settings />} />
       </Route>
     </Routes>
