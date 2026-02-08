@@ -98,12 +98,15 @@ MAX_GAP_PCT = 0.015            # No gaps > 1.5% in 3 days
 EVENT_BLACKOUT_DAYS = 7        # No entries within 7 days of event
 
 # Liquidity Filters
-MIN_BID_ASK_SPREAD = 2.0       # Max bid-ask spread in INR
-MIN_OPEN_INTEREST = 10000      # Minimum OI for strike selection
+MIN_BID_ASK_SPREAD = 1.0       # Max bid-ask spread in INR (tighter = more liquid)
+MIN_OPEN_INTEREST = 100000     # Minimum OI for strike selection (v2 rulebook: >10x size for 50-lot)
 
 # Slippage and Costs
 SLIPPAGE_PCT = 0.002           # 0.2% slippage assumption
 BROKERAGE_PCT = 0.0007         # 0.07% per order (not per trade value)
+
+# Commission and taxes (percentage of turnover). Default 0.08% = 0.0008
+COMMISSION_TAX_PCT = 0.0008
 
 # Order-based cost model
 # Charges are per ORDER, not per trade value

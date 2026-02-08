@@ -19,7 +19,10 @@ from loguru import logger
 from app.core.kite_client import KiteClient
 from app.core.credentials import get_kite_credentials
 from app.config.settings import Settings
-from app.config.constants import NIFTY_TOKEN, BANKNIFTY_TOKEN, INDIA_VIX_TOKEN
+from app.config.constants import (
+    NIFTY_TOKEN, BANKNIFTY_TOKEN, INDIA_VIX_TOKEN,
+    GOLDM_TOKEN, SILVERM_TOKEN, CRUDE_TOKEN, NATURALGAS_TOKEN
+)
 
 
 # Configuration
@@ -27,6 +30,11 @@ INSTRUMENTS = {
     "NIFTY": {"token": NIFTY_TOKEN, "intervals": ["minute", "5minute", "day"]},
     "BANKNIFTY": {"token": BANKNIFTY_TOKEN, "intervals": ["minute", "5minute", "day"]},
     "INDIAVIX": {"token": INDIA_VIX_TOKEN, "intervals": ["day"]},
+    # MCX Commodities
+    "GOLDM": {"token": GOLDM_TOKEN, "intervals": ["minute", "5minute", "day"]},
+    "SILVERM": {"token": SILVERM_TOKEN, "intervals": ["minute", "5minute", "day"]},
+    "CRUDE": {"token": CRUDE_TOKEN, "intervals": ["minute", "5minute", "day"]},
+    "NATURALGAS": {"token": NATURALGAS_TOKEN, "intervals": ["minute", "5minute", "day"]},
 }
 
 # Date range for backtesting (Nov 1, 2025 to present)

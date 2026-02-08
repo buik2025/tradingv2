@@ -49,6 +49,7 @@ class StrategyBacktestRequest(BaseModel):
     # Execution assumptions
     slippage_pct: float = Field(default=0.001, ge=0, le=0.01)
     brokerage_pct: float = Field(default=0.0003, ge=0, le=0.01)
+    commission_tax_pct: float = Field(default=0.0008, ge=0, le=0.01, description="Commission and tax as decimal (0.0008 = 0.08pct)")
 
 
 class MonteCarloRequest(BaseModel):
@@ -207,6 +208,7 @@ async def run_strategy_backtest(request: StrategyBacktestRequest):
         end_date=request.end_date,
         slippage_pct=request.slippage_pct,
         brokerage_pct=request.brokerage_pct,
+        commission_tax_pct=request.commission_tax_pct,
         max_loss_per_trade=request.max_loss_per_trade,
         max_daily_loss=request.max_daily_loss
     )

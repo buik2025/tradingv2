@@ -53,6 +53,9 @@ class KiteClient:
         self._quote_cache: Dict[int, Dict] = {}
         self._cache_timestamp: Optional[datetime] = None
         self._cache_ttl = 5  # seconds
+        # Basket margins cache
+        self._basket_margin_cache: Dict[str, Dict] = {}
+        self._basket_cache_ttl = 300  # seconds
         
         # Paper orders tracking
         self._paper_orders: Dict[str, Dict] = {}
@@ -569,6 +572,85 @@ class KiteClient:
         except Exception as e:
             logger.error(f"Failed to get order margins: {e}")
             return []
+
+    def get_basket_margins(self, basket: dict) -> dict:
+        """Get margins for a basket (single payload) with caching and fallbacks.
+
+        Args:
+            basket: Dict describing the basket/order payload expected by Kite's
+                    basket_order_margins API (list of orders under a key like 'orders').
+
+        Returns:
+            Dict with margin details or empty dict on error.
+        """
+        if not basket:
+            return {}
+
+        # Cache key based on stringified basket
+        try:
+            import json
+            key = json.dumps(basket, sort_keys=True)
+        except Exception:
+            key = str(basket)
+
+        # Check cache
+        cached = self._basket_margin_cache.get(key)
+        if cached:
+            ts = cached.get("_ts")
+            if ts and (datetime.now() - ts).seconds < self._basket_cache_ttl:
+                return cached.get("value", {})
+
+        if self.mock_mode:
+            # Return a conservative mock margin for testing
+            resp = {"required_margin": 100000, "details": []}
+            self._basket_margin_cache[key] = {"_ts": datetime.now(), "value": resp}
+            return resp
+
+        # Prefer `basket_order_margins` if available on Kite SDK
+        try:
+            if hasattr(self._kite, "basket_order_margins"):
+                try:
+                    resp = self._retry_request(self._kite.basket_order_margins, basket)
+                except Exception as e:
+                    logger.warning(f"basket_order_margins failed: {e} - attempting order_margins fallback")
+                    orders = basket.get("orders") or basket.get("orders_payload") or []
+                    if orders:
+                        try:
+                            resp = self._retry_request(self._kite.order_margins, orders)
+                        except Exception as e2:
+                            logger.error(f"order_margins fallback also failed: {e2}")
+                            raise
+                    else:
+                        raise
+            else:
+                # Fallback: use order_margins with the orders list if present
+                orders = basket.get("orders") or basket.get("orders_payload") or []
+                if orders:
+                    resp = self._retry_request(self._kite.order_margins, orders)
+                else:
+                    resp = {}
+
+            # Cache and return
+            self._basket_margin_cache[key] = {"_ts": datetime.now(), "value": resp}
+            return resp
+
+        except TokenException as e:
+            logger.warning(f"Token error while fetching basket margins: {e}")
+            # Try refresh once via existing logic
+            try:
+                if self.refresh_session():
+                    if hasattr(self._kite, "basket_order_margins"):
+                        resp = self._retry_request(self._kite.basket_order_margins, basket)
+                        self._basket_margin_cache[key] = {"_ts": datetime.now(), "value": resp}
+                        return resp
+            except Exception:
+                pass
+
+        except Exception as e:
+            logger.error(f"Failed to get basket margins: {e}")
+
+        # Final fallback: return empty dict
+        return {}
     
     def get_instruments(self, exchange: str = "NFO") -> pd.DataFrame:
         """Get all instruments for an exchange."""

@@ -111,6 +111,16 @@ class TradeProposal(BaseModel):
     expiry: date = Field(..., description="Expiry date")
     days_to_expiry: int = Field(..., description="Days to expiry")
     
+    # Dynamic Exit Targeting (Section 4 of rulebook)
+    exit_target_low: float = Field(..., description="Lower bound for profit target")
+    exit_target_high: float = Field(..., description="Upper bound for profit target")
+    exit_margin_type: str = Field("margin", description="Type: 'margin' or 'percentage'")
+    
+    # Trailing Profit Settings (Section 11 of rulebook)
+    enable_trailing: bool = Field(True, description="Enable trailing profit logic")
+    trailing_profit_threshold: float = Field(0.5, description="Start trailing at 50% of target")
+    trailing_mode: str = Field("none", description="'atr' for directional, 'bbw' for short-vol")
+    
     # Context
     regime_at_entry: str = Field(..., description="Regime when signal generated")
     entry_reason: str = Field(..., description="Reason for entry")
@@ -129,6 +139,16 @@ class TradeProposal(BaseModel):
             greeks["vega"] += leg.vega * multiplier
         self.greeks = greeks
         return greeks
+    
+    def get_dynamic_target(self, entry_margin: float) -> tuple:
+        """Calculate dynamic exit target based on entry margin."""
+        if self.exit_margin_type == "margin":
+            low = entry_margin * self.exit_target_low
+            high = entry_margin * self.exit_target_high
+        else:
+            low = self.max_profit * self.exit_target_low
+            high = self.max_profit * self.exit_target_high
+        return low, high
 
 
 class TradeSignal(BaseModel):

@@ -93,12 +93,4 @@ coverage/
 # ===================
 # Docs / Misc
 # ===================
-backend/data/instruments_cache.json
-backend/data/trading.db
-backend/data/cache/256265_5minute.parquet
-backend/data/cache/256265_day.parquet
-backend/data/cache/260105_day.parquet
-backend/data/cache/256265_minute.parquet
-backend/data/cache/260105_5minute.parquet
-backend/data/cache/260105_minute.parquet
-backend/data/cache/264969_day.parquet
+backend/data/

@@ -59,6 +59,19 @@ class Position(BaseModel):
     regime_at_entry: str = Field(..., description="Regime at entry")
     entry_reason: str = Field("", description="Entry reason")
     
+    # Dynamic Exit Targeting (Section 4 - rulebook)
+    exit_target_low: float = Field(..., description="Lower bound profit target")
+    exit_target_high: float = Field(..., description="Upper bound profit target")
+    current_target: float = Field(..., description="Current active profit target")
+    
+    # Trailing Profit (Section 11 - rulebook)
+    trailing_enabled: bool = Field(True, description="Enable trailing logic")
+    trailing_mode: str = Field("none", description="'atr' or 'bbw' or 'none'")
+    trailing_active: bool = Field(False, description="Trailing currently active")
+    trailing_threshold: float = Field(0.5, description="Activate trailing at 50% profit")
+    trailing_stop: Optional[float] = Field(None, description="Current trailing stop")
+    trailing_last_update: Optional[datetime] = Field(None, description="Last update time")
+    
     # Flags
     is_intraday: bool = Field(False)
     is_hedged: bool = Field(True, description="True if defined-risk")
@@ -103,11 +116,54 @@ class Position(BaseModel):
     
     def should_exit_profit(self) -> bool:
         """Check if profit target hit."""
-        return self.current_pnl >= self.target_pnl
+        return self.current_pnl >= self.current_target
     
     def should_exit_stop(self) -> bool:
         """Check if stop loss hit."""
         return self.current_pnl <= self.stop_loss
+    
+    def update_trailing_stop(self, current_price: float, atr: Optional[float] = None,
+                            bbw_ratio: Optional[float] = None) -> bool:
+        """
+        Update trailing stop based on market conditions.
+        
+        Section 11 of rulebook:
+        - ATR-based for directional (±0.5x ATR, update every 15 min)
+        - BBW-based for short-vol (>1.8x avg → exit if profitable)
+        
+        Returns True if trailing stop should trigger exit
+        """
+        if not self.trailing_enabled or self.trailing_mode == "none":
+            return False
+        
+        # Activate trailing at 50% of target profit
+        if not self.trailing_active and self.current_pnl >= self.current_target * self.trailing_threshold:
+            self.trailing_active = True
+            self.trailing_last_update = datetime.now()
+            return False
+        
+        if not self.trailing_active:
+            return False
+        
+        # Update based on mode
+        if self.trailing_mode == "atr" and atr is not None:
+            # ATR-based: ±0.5x ATR stop
+            new_stop = current_price - (atr * 0.5)
+            if self.trailing_stop is None or new_stop > self.trailing_stop:
+                self.trailing_stop = new_stop
+                self.trailing_last_update = datetime.now()
+            return self.current_pnl <= self.trailing_stop
+        
+        elif self.trailing_mode == "bbw" and bbw_ratio is not None:
+            # BBW-based: expand at >1.8x avg
+            if bbw_ratio > 1.8 and self.current_pnl > 0:
+                lock_amount = self.current_target * 0.6
+                if self.trailing_stop is None or lock_amount > self.trailing_stop:
+                    self.trailing_stop = lock_amount
+                    self.trailing_last_update = datetime.now()
+                return False
+        
+        return False
     
     def should_exit_time(self, current_dte: int) -> bool:
         """Check if time-based exit triggered."""

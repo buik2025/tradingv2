@@ -217,7 +217,12 @@ class Executor(BaseAgent):
         from datetime import date
         days_to_expiry = (signal.legs[0].expiry - date.today()).days if signal.legs[0].expiry else 0
         
-        return Position(
+        # Get dynamic exit targets from signal (Section 4 - rulebook)
+        exit_target_low = getattr(signal, 'exit_target_low', signal.target_pnl * 0.8)
+        exit_target_high = getattr(signal, 'exit_target_high', signal.target_pnl * 1.2)
+        trailing_mode = getattr(signal, 'trailing_mode', 'none')
+        
+        position = Position(
             signal_id=signal.id,
             strategy_type=signal.structure,
             instrument=signal.instrument,
@@ -232,8 +237,18 @@ class Executor(BaseAgent):
             days_to_expiry=days_to_expiry,
             exit_dte=signal.exit_dte,
             regime_at_entry=signal.structure.value,
-            is_intraday=signal.product == "MIS"
+            is_intraday=signal.product == "MIS",
+            # Section 4: Dynamic exit targeting
+            exit_target_low=exit_target_low,
+            exit_target_high=exit_target_high,
+            current_target=signal.target_pnl,
+            # Section 11: Trailing profit setup
+            trailing_enabled=getattr(signal, 'enable_trailing', True),
+            trailing_mode=trailing_mode,
+            trailing_threshold=getattr(signal, 'trailing_profit_threshold', 0.5)
         )
+        
+        return position
     
     def monitor_positions(
         self,
@@ -270,7 +285,21 @@ class Executor(BaseAgent):
                     ))
                     continue
             
-            # Check profit target
+            # Check for trailing profit (Section 11 - rulebook)
+            if position.trailing_enabled and position.trailing_mode != "none":
+                # Get metrics for trailing calculation
+                atr = getattr(position, '_cached_atr', None)
+                bbw_ratio = getattr(position, '_cached_bbw_ratio', None)
+                
+                if position.update_trailing_stop(position.current_price, atr, bbw_ratio):
+                    exit_orders.append(ExitOrder(
+                        position_id=pos_id,
+                        exit_reason="TRAILING_STOP",
+                        exit_type="TRAILING_STOP"
+                    ))
+                    continue
+            
+            # Check profit target (dynamic from Section 4)
             if position.should_exit_profit():
                 exit_orders.append(ExitOrder(
                     position_id=pos_id,
