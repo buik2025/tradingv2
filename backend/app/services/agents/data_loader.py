@@ -6,7 +6,7 @@ from typing import Optional, Dict, List
 import pandas as pd
 from loguru import logger
 
-from ..core.kite_client import KiteClient
+from ...core.kite_client import KiteClient
 
 
 class DataLoader:

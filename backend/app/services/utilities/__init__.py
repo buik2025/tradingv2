@@ -1,10 +1,13 @@
 """Utility services and helpers"""
 
 from .instrument_cache import InstrumentCache
-from .option_pricing import OptionPricingModel, black_scholes
+from .option_pricing import OptionPricingEngine, BlackScholesCalculator, HistoricalVolatility
+from .pnl_calculator import PnLCalculator
 
 __all__ = [
     "InstrumentCache",
-    "OptionPricingModel",
-    "black_scholes",
+    "OptionPricingEngine",
+    "BlackScholesCalculator",
+    "HistoricalVolatility",
+    "PnLCalculator",
 ]

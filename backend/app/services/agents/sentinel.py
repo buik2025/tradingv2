@@ -7,14 +7,14 @@ import numpy as np
 from loguru import logger
 
 from .base_agent import BaseAgent
-from ..core.kite_client import KiteClient
-from ..core.data_cache import DataCache
-from ..config.settings import Settings
-from ..config.constants import (
+from ...core.kite_client import KiteClient
+from ...core.data_cache import DataCache
+from ...config.settings import Settings
+from ...config.constants import (
     NIFTY_TOKEN, BANKNIFTY_TOKEN, INDIA_VIX_TOKEN,
     INTERVAL_5MIN, INTERVAL_DAY, REGIME_LOOKBACK_DAYS
 )
-from ..config.thresholds import (
+from ...config.thresholds import (
     ADX_RANGE_BOUND, ADX_MEAN_REVERSION_MAX, ADX_TREND_MIN,
     RSI_OVERSOLD, RSI_OVERBOUGHT, RSI_NEUTRAL_MIN, RSI_NEUTRAL_MAX,
     IV_PERCENTILE_SHORT_VOL, IV_PERCENTILE_STRANGLE, IV_PERCENTILE_CHAOS,
@@ -24,14 +24,15 @@ from ..config.thresholds import (
     MIN_CHAOS_TRIGGERS, MIN_CAUTION_TRIGGERS,
     BBW_RANGE_BOUND, BBW_EXPANSION,
     RV_IV_THETA_FRIENDLY, RV_IV_STRONG_THETA,
-    VOLUME_SURGE, VOLUME_LOW
+    VOLUME_SURGE, VOLUME_LOW,
+    VIX_LOW_THRESHOLD, VIX_HIGH_THRESHOLD
 )
-from ..models.regime import RegimeType, RegimePacket, RegimeMetrics, ConfluenceScore
-from .technical import (
+from ...models.regime import RegimeType, RegimePacket, RegimeMetrics, ConfluenceScore
+from ..indicators.technical import (
     calculate_adx, calculate_rsi, calculate_atr, calculate_day_range,
     calculate_bollinger_band_width, calculate_bbw_ratio, calculate_volume_ratio
 )
-from .volatility import (
+from ..indicators.volatility import (
     calculate_iv_percentile, calculate_realized_vol, 
     calculate_correlation, detect_correlation_spike,
     calculate_rv_iv_ratio, detect_correlation_spike_dynamic
@@ -281,6 +282,8 @@ class Sentinel(BaseAgent):
         Key change: Require 3+ triggers for CHAOS to prevent false positives.
         2 triggers = CAUTION (allow hedged trades only).
         
+        VIX-aware: High ADX with low VIX = TREND, not CHAOS.
+        
         Priority:
         1. CHAOS (3+ triggers)
         2. CAUTION (2 triggers)
@@ -289,6 +292,12 @@ class Sentinel(BaseAgent):
         5. TREND (high ADX)
         """
         confluence = ConfluenceScore()
+        
+        # Get current VIX level for context-aware chaos detection
+        # Low VIX (<14) dampens chaos signals - market is calm even if trending
+        # Use IV percentile as proxy: IV%ile < 70% generally means VIX is reasonable
+        # IV%ile 63% with VIX at 12 is a calm trending market
+        is_low_vix_environment = metrics.iv_percentile < IV_PERCENTILE_CHAOS  # < 75%
         
         # === CHAOS TRIGGERS (negative score) ===
         
@@ -314,23 +323,32 @@ class Sentinel(BaseAgent):
             is_chaos=True
         )
         
-        # 3. Correlation spike (use dynamic threshold for intra-equity)
+        # 3. Correlation spike (use higher threshold for intra-equity pairs like NIFTY-BANKNIFTY)
+        # NIFTY-BANKNIFTY normally correlate at 0.85-0.95, so only trigger on extreme (>0.95)
         max_corr = max([abs(v) for v in correlations.values()], default=0)
+        # Only trigger chaos if correlation exceeds 0.95 (truly abnormal) OR >0.85 with high VIX
+        CORR_EXTREME_THRESHOLD = 0.95  # Truly abnormal correlation
+        corr_chaos_triggered = max_corr > CORR_EXTREME_THRESHOLD or (
+            max_corr > CORRELATION_INTRA_EQUITY and not is_low_vix_environment
+        )
         confluence.add_trigger(
             name="Correlation Spike",
-            triggered=max_corr > CORRELATION_INTRA_EQUITY,
+            triggered=corr_chaos_triggered,
             value=max_corr,
-            threshold=CORRELATION_INTRA_EQUITY,
+            threshold=CORR_EXTREME_THRESHOLD,
             direction="above",
             weight=1.0,
             is_chaos=True
         )
         
-        # 4. Same ADX trigger for chaos (high trend)
+        # 4. ADX trigger for chaos - BUT only if VIX is also high
+        # High ADX + Low VIX = clean TREND, not chaos
+        # High ADX + High VIX = potential chaos/whipsaw
         ADX_CHAOS_LEVEL = 35
+        adx_chaos_triggered = metrics.adx > ADX_CHAOS_LEVEL and not is_low_vix_environment
         confluence.add_trigger(
             name="ADX Chaos",
-            triggered=metrics.adx > ADX_CHAOS_LEVEL,
+            triggered=adx_chaos_triggered,
             value=metrics.adx,
             threshold=ADX_CHAOS_LEVEL,
             direction="above",

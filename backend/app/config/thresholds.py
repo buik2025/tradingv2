@@ -18,9 +18,13 @@ IV_HIGH = 70                     # IV > 70% = High Volatility (Safety check)
 
 # Correlation Thresholds (Differentiated by asset type)
 CORRELATION_THRESHOLD = 0.4      # |corr| > 0.4 = Disable secondary
-CORRELATION_INTRA_EQUITY = 0.5   # NIFTY-BANKNIFTY-SENSEX (raised from 0.3)
+CORRELATION_INTRA_EQUITY = 0.85  # NIFTY-BANKNIFTY-SENSEX (raised to 0.85 - normal range is 0.85-0.95)
 CORRELATION_MULTI_ASSET = 0.4    # NIFTY-Gold/Crude
-CORRELATION_CHAOS = 0.5          # |corr| > 0.5 = Chaos signal (only with confirmation)
+CORRELATION_CHAOS = 0.85         # |corr| > 0.85 = Chaos signal (only with confirmation)
+
+# VIX-based Chaos Dampening (NEW)
+VIX_LOW_THRESHOLD = 14           # VIX < 14 = Low vol environment, dampen chaos signals
+VIX_HIGH_THRESHOLD = 20          # VIX > 20 = High vol, chaos signals more valid
 
 # Confluence Requirements (NEW - prevents false positives)
 MIN_CHAOS_TRIGGERS = 3           # Require 3+ triggers for CHAOS classification
@@ -98,8 +102,8 @@ MAX_GAP_PCT = 0.015            # No gaps > 1.5% in 3 days
 EVENT_BLACKOUT_DAYS = 7        # No entries within 7 days of event
 
 # Liquidity Filters
-MIN_BID_ASK_SPREAD = 1.0       # Max bid-ask spread in INR (tighter = more liquid)
-MIN_OPEN_INTEREST = 100000     # Minimum OI for strike selection (v2 rulebook: >10x size for 50-lot)
+MIN_BID_ASK_SPREAD = 5.0       # Max bid-ask spread in INR (relaxed for paper trading)
+MIN_OPEN_INTEREST = 1000       # Minimum OI for strike selection (lowered for paper trading)
 
 # Slippage and Costs
 SLIPPAGE_PCT = 0.002           # 0.2% slippage assumption
@@ -127,3 +131,24 @@ BRAKE_FLAT_DAYS = 1            # Flat for 1 day after brake triggered
 LOTS_RAMP_THRESHOLD_1 = 1.10   # 10% equity growth -> 2 lots
 LOTS_RAMP_THRESHOLD_2 = 1.25   # 25% equity growth -> 3 lots
 MAX_LOTS = 3                   # Maximum lots per position
+
+# Consecutive Losers Settings (Section 6 - v2 rulebook)
+CONSECUTIVE_LOSERS_THRESHOLD = 3  # 3 consecutive losers triggers reduction
+CONSECUTIVE_LOSERS_REDUCTION = 0.50  # Reduce size by 50%
+CONSECUTIVE_LOSERS_FLAT_DAYS = 1  # Flat for 1 day after 3 losers
+
+# Win-Based Sizing Cap (Section 7 - v2 rulebook)
+WIN_STREAK_THRESHOLD = 3  # 3 consecutive wins triggers cap
+WIN_STREAK_SIZE_CAP = 0.80  # Cap sizing at 80% after win streak
+
+# Low-VIX Margin Bonus (Section 5 - v2 rulebook)
+LOW_VIX_THRESHOLD = 14  # VIX < 14 = low volatility
+LOW_VIX_MARGIN_BONUS = 0.10  # +10% margin allowance in low-vol
+
+# Correlation-Based Diversification (Section 5 - v2 rulebook)
+DIVERSIFICATION_CORR_THRESHOLD = 0.3  # Corr > 0.3 triggers diversification
+DIVERSIFICATION_REDUCTION = 0.50  # Halve higher-vol asset size
+
+# Slippage Alert Settings (Section 8 - v2 rulebook)
+SLIPPAGE_ALERT_THRESHOLD = 0.005  # >0.5% slippage triggers alert
+SLIPPAGE_AUTO_CORRECT_THRESHOLD = 0.01  # >1% slippage triggers auto-correct

@@ -57,6 +57,11 @@ class KiteClient:
         self._basket_margin_cache: Dict[str, Dict] = {}
         self._basket_cache_ttl = 300  # seconds
         
+        # Instruments cache (refresh once per day)
+        self._instruments_cache: Dict[str, pd.DataFrame] = {}
+        self._instruments_cache_timestamp: Optional[datetime] = None
+        self._instruments_cache_ttl = 3600  # 1 hour
+        
         # Paper orders tracking
         self._paper_orders: Dict[str, Dict] = {}
         self._paper_positions: Dict[str, Dict] = {}
@@ -296,28 +301,30 @@ class KiteClient:
             return self._mock_option_chain(underlying, expiry)
         
         try:
-            # Get instruments for the underlying
-            instruments = self._kite.instruments("NFO")
-            df = pd.DataFrame(instruments)
+            # Get instruments for the underlying (use cached version to avoid rate limits)
+            df = self.get_instruments("NFO")
+            if df.empty:
+                logger.warning("Empty instruments list from cache")
+                return pd.DataFrame()
             
-            # Filter for options
+            # Filter for options - use .copy() to avoid SettingWithCopyWarning
             df = df[
                 (df['name'] == underlying) &
                 (df['instrument_type'].isin(['CE', 'PE'])) &
                 (df['expiry'] == expiry)
-            ]
+            ].copy()
             
             if strike_range:
-                df = df[(df['strike'] >= strike_range[0]) & (df['strike'] <= strike_range[1])]
+                df = df[(df['strike'] >= strike_range[0]) & (df['strike'] <= strike_range[1])].copy()
             
             # Get quotes for all options
             tokens = df['instrument_token'].tolist()
             if tokens:
                 quotes = self.get_quote(tokens)
-                df['ltp'] = df['instrument_token'].map(lambda t: quotes.get(t, {}).get('last_price', 0))
-                df['bid'] = df['instrument_token'].map(lambda t: quotes.get(t, {}).get('depth', {}).get('buy', [{}])[0].get('price', 0))
-                df['ask'] = df['instrument_token'].map(lambda t: quotes.get(t, {}).get('depth', {}).get('sell', [{}])[0].get('price', 0))
-                df['oi'] = df['instrument_token'].map(lambda t: quotes.get(t, {}).get('oi', 0))
+                df.loc[:, 'ltp'] = df['instrument_token'].map(lambda t: quotes.get(t, {}).get('last_price', 0))
+                df.loc[:, 'bid'] = df['instrument_token'].map(lambda t: quotes.get(t, {}).get('depth', {}).get('buy', [{}])[0].get('price', 0))
+                df.loc[:, 'ask'] = df['instrument_token'].map(lambda t: quotes.get(t, {}).get('depth', {}).get('sell', [{}])[0].get('price', 0))
+                df.loc[:, 'oi'] = df['instrument_token'].map(lambda t: quotes.get(t, {}).get('oi', 0))
             
             return df
             
@@ -358,15 +365,51 @@ class KiteClient:
         if self.mock_mode or self.paper_mode:
             order_id = f"PAPER_{datetime.now().strftime('%Y%m%d%H%M%S%f')}_{tradingsymbol}"
             
-            # Get current price for paper fill
-            fill_price = price
-            if order_type == "MARKET" and self._kite and not self.mock_mode:
+            # Get current market price
+            market_price = price or 0
+            if self._kite and not self.mock_mode:
                 try:
                     quote = self.get_ltp([self._get_token_for_symbol(tradingsymbol, exchange)])
                     if quote:
-                        fill_price = list(quote.values())[0]
+                        market_price = list(quote.values())[0]
                 except:
-                    fill_price = price or 0
+                    pass
+            
+            # Determine fill behavior based on order type
+            if order_type == "MARKET":
+                # Market orders fill immediately at market price
+                fill_price = market_price or price or 0
+                status = "COMPLETE"
+                filled_quantity = quantity
+                pending_quantity = 0
+            elif order_type == "LIMIT":
+                # Limit orders: check if price is favorable for immediate fill
+                # BUY limit fills if market <= limit price
+                # SELL limit fills if market >= limit price
+                can_fill = False
+                if market_price and price:
+                    if transaction_type == "BUY" and market_price <= price:
+                        can_fill = True
+                    elif transaction_type == "SELL" and market_price >= price:
+                        can_fill = True
+                
+                if can_fill:
+                    fill_price = price  # Fill at limit price
+                    status = "COMPLETE"
+                    filled_quantity = quantity
+                    pending_quantity = 0
+                else:
+                    # Order stays open, waiting for price to reach limit
+                    fill_price = None
+                    status = "OPEN"
+                    filled_quantity = 0
+                    pending_quantity = quantity
+            else:
+                # SL, SL-M orders - treat as open for now
+                fill_price = None
+                status = "OPEN"
+                filled_quantity = 0
+                pending_quantity = quantity
             
             # Track paper order
             self._paper_orders[order_id] = {
@@ -378,16 +421,19 @@ class KiteClient:
                 "order_type": order_type,
                 "product": product,
                 "price": price,
+                "trigger_price": trigger_price,
                 "average_price": fill_price,
-                "status": "COMPLETE",
-                "filled_quantity": quantity,
-                "pending_quantity": 0,
+                "status": status,
+                "filled_quantity": filled_quantity,
+                "pending_quantity": pending_quantity,
                 "order_timestamp": datetime.now(),
-                "tag": tag
+                "tag": tag,
+                "instrument_token": self._get_token_for_symbol(tradingsymbol, exchange)
             }
             
             mode = "MOCK" if self.mock_mode else "PAPER"
-            logger.info(f"[{mode}] ORDER placed: {order_id} - {transaction_type} {quantity} {tradingsymbol} @ {fill_price}")
+            status_str = f"@ {fill_price}" if status == "COMPLETE" else f"PENDING @ {price}"
+            logger.info(f"[{mode}] ORDER placed: {order_id} - {transaction_type} {quantity} {tradingsymbol} {status_str}")
             return order_id
         
         # Live mode - real order
@@ -487,14 +533,103 @@ class KiteClient:
         """Get order history for a specific order."""
         if self.mock_mode or self.paper_mode:
             if order_id in self._paper_orders:
+                # For paper orders, check if pending limit orders can now be filled
+                self._update_paper_order_status(order_id)
                 return [self._paper_orders[order_id]]
             return []
+    
+    def _update_paper_order_status(self, order_id: str) -> None:
+        """
+        Update paper order status based on current market price.
+        
+        For LIMIT orders that are OPEN, check if market price has reached
+        the limit price and fill them accordingly.
+        """
+        if order_id not in self._paper_orders:
+            return
+        
+        order = self._paper_orders[order_id]
+        
+        # Only process OPEN orders
+        if order.get("status") != "OPEN":
+            return
+        
+        order_type = order.get("order_type")
+        if order_type not in ["LIMIT", "SL", "SL-M"]:
+            return
+        
+        # Get current market price
+        instrument_token = order.get("instrument_token")
+        tradingsymbol = order.get("tradingsymbol")
+        exchange = order.get("exchange", "NFO")
+        
+        market_price = None
+        if self._kite and not self.mock_mode:
+            try:
+                quote = self.get_ltp([instrument_token] if instrument_token else [])
+                if quote:
+                    market_price = list(quote.values())[0]
+            except:
+                pass
+        
+        if not market_price:
+            return
+        
+        limit_price = order.get("price")
+        trigger_price = order.get("trigger_price")
+        transaction_type = order.get("transaction_type")
+        
+        can_fill = False
+        
+        if order_type == "LIMIT" and limit_price:
+            # BUY limit fills if market <= limit price
+            # SELL limit fills if market >= limit price
+            if transaction_type == "BUY" and market_price <= limit_price:
+                can_fill = True
+            elif transaction_type == "SELL" and market_price >= limit_price:
+                can_fill = True
+        elif order_type in ["SL", "SL-M"] and trigger_price:
+            # SL BUY triggers if market >= trigger price
+            # SL SELL triggers if market <= trigger price
+            if transaction_type == "BUY" and market_price >= trigger_price:
+                can_fill = True
+            elif transaction_type == "SELL" and market_price <= trigger_price:
+                can_fill = True
+        
+        if can_fill:
+            fill_price = limit_price if order_type == "LIMIT" else market_price
+            order["status"] = "COMPLETE"
+            order["average_price"] = fill_price
+            order["filled_quantity"] = order["quantity"]
+            order["pending_quantity"] = 0
+            logger.info(f"[PAPER] ORDER filled: {order_id} - {transaction_type} {order['quantity']} {tradingsymbol} @ {fill_price}")
         
         try:
             return self._retry_request(self._kite.order_history, order_id)
         except Exception as e:
             logger.error(f"Failed to get order history: {e}")
             return []
+    
+    def poll_paper_orders(self) -> int:
+        """
+        Poll all open paper orders and update their status based on market prices.
+        
+        Returns:
+            Number of orders that were filled
+        """
+        if not (self.mock_mode or self.paper_mode):
+            return 0
+        
+        filled_count = 0
+        open_orders = [oid for oid, o in self._paper_orders.items() if o.get("status") == "OPEN"]
+        
+        for order_id in open_orders:
+            old_status = self._paper_orders[order_id].get("status")
+            self._update_paper_order_status(order_id)
+            if self._paper_orders[order_id].get("status") == "COMPLETE" and old_status == "OPEN":
+                filled_count += 1
+        
+        return filled_count
     
     def get_positions(self) -> Dict[str, List[Dict]]:
         """Get all positions (day and net)."""
@@ -653,15 +788,39 @@ class KiteClient:
         return {}
     
     def get_instruments(self, exchange: str = "NFO") -> pd.DataFrame:
-        """Get all instruments for an exchange."""
+        """Get all instruments for an exchange (cached to avoid rate limits)."""
         if self.mock_mode:
             return pd.DataFrame()
         
+        # Check cache first
+        cache_valid = (
+            self._instruments_cache_timestamp and 
+            (datetime.now() - self._instruments_cache_timestamp).seconds < self._instruments_cache_ttl and
+            exchange in self._instruments_cache and
+            not self._instruments_cache[exchange].empty
+        )
+        
+        if cache_valid:
+            logger.debug(f"Using cached instruments for {exchange}")
+            return self._instruments_cache[exchange]
+        
         try:
+            logger.info(f"Fetching instruments for {exchange} from API...")
             instruments = self._retry_request(self._kite.instruments, exchange)
-            return pd.DataFrame(instruments)
+            df = pd.DataFrame(instruments)
+            
+            # Cache the result
+            self._instruments_cache[exchange] = df
+            self._instruments_cache_timestamp = datetime.now()
+            logger.info(f"Cached {len(df)} instruments for {exchange}")
+            
+            return df
         except Exception as e:
             logger.error(f"Failed to get instruments: {e}")
+            # Return cached data if available, even if stale
+            if exchange in self._instruments_cache:
+                logger.warning(f"Returning stale cached instruments for {exchange}")
+                return self._instruments_cache[exchange]
             return pd.DataFrame()
     
     def _is_cache_valid(self) -> bool:

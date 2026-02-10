@@ -193,26 +193,43 @@ async def run_backtest(request: BacktestRequest):
 
 # ============== Trading ==============
 
-# Global orchestrator instance
+# Global orchestrator instance and task reference
 _orchestrator = None
+_orchestrator_task = None
 
 
 @router.post("/trading/start")
-async def start_trading(mode: str = "paper", interval_seconds: int = 30, background_tasks: BackgroundTasks = None):
+async def start_trading(mode: str = "paper", interval_seconds: int = 30):
     """Start the trading system."""
-    global _orchestrator
+    global _orchestrator, _orchestrator_task
     
-    if _orchestrator and _orchestrator.running:
+    # Check if task is actually running (not just orchestrator exists)
+    if _orchestrator_task is not None and not _orchestrator_task.done():
         raise HTTPException(status_code=400, detail="Trading already running")
     
     from ..config.settings import Settings
     from .orchestrator import Orchestrator
+    import asyncio
     
+    logger.info(f"Creating orchestrator in {mode} mode...")
     config = Settings()
     _orchestrator = Orchestrator(config, mode)
+    logger.info("Orchestrator created, starting task...")
     
-    if background_tasks:
-        background_tasks.add_task(_orchestrator.run, interval_seconds)
+    # Store task reference to prevent garbage collection and track status
+    _orchestrator_task = asyncio.create_task(_orchestrator.run(interval_seconds))
+    logger.info(f"Task created: {_orchestrator_task}")
+    
+    # Add callback to log any errors
+    def on_task_done(task):
+        try:
+            exc = task.exception()
+            if exc:
+                logger.error(f"Trading loop failed with error: {exc}")
+        except asyncio.CancelledError:
+            logger.info("Trading loop task was cancelled")
+    
+    _orchestrator_task.add_done_callback(on_task_done)
     
     return {"message": f"Trading started in {mode.upper()} mode with {interval_seconds}s interval"}
 
@@ -220,21 +237,27 @@ async def start_trading(mode: str = "paper", interval_seconds: int = 30, backgro
 @router.post("/trading/stop")
 async def stop_trading():
     """Stop the trading system."""
-    global _orchestrator
+    global _orchestrator, _orchestrator_task
     
-    if not _orchestrator:
+    if _orchestrator_task is None or _orchestrator_task.done():
         raise HTTPException(status_code=400, detail="Trading not running")
     
     _orchestrator.stop()
+    # Cancel the task if still running
+    if not _orchestrator_task.done():
+        _orchestrator_task.cancel()
     return {"message": "Trading stopped"}
 
 
 @router.get("/trading/status", response_model=TradingStatusResponse)
 async def get_trading_status():
     """Get current trading status."""
-    global _orchestrator
+    global _orchestrator, _orchestrator_task
     
-    if not _orchestrator:
+    # Check actual task status, not just orchestrator existence
+    is_running = _orchestrator_task is not None and not _orchestrator_task.done()
+    
+    if not _orchestrator or not is_running:
         return TradingStatusResponse(
             mode="stopped",
             running=False,
@@ -245,9 +268,9 @@ async def get_trading_status():
     
     return TradingStatusResponse(
         mode=_orchestrator.mode,
-        running=_orchestrator.running,
-        positions=len(_orchestrator.executor.get_open_positions()) if _orchestrator.running else 0,
-        daily_pnl=_orchestrator.state_manager.get("daily_pnl", 0.0) if _orchestrator.running else 0,
+        running=is_running,
+        positions=len(_orchestrator.executor.get_open_positions()) if is_running else 0,
+        daily_pnl=_orchestrator.state_manager.get("daily_pnl", 0.0) if is_running else 0,
         regime=None  # Would need to track last regime
     )
 
@@ -1525,7 +1548,7 @@ async def get_current_regime(request: Request):
     from ..core.kite_client import KiteClient
     from ..config.settings import Settings
     from ..config.constants import NIFTY_TOKEN
-    from ..services.sentinel import Sentinel
+    from ..services.agents import Sentinel
     from ..core.data_cache import DataCache
     from .auth import get_access_token
     

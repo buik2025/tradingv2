@@ -80,7 +80,19 @@ class GreeksCalculator:
             "vega": float(vega),
             "rho": float(rho)
         }
-    
+
+# --- utility methods ---
+    def calculate_time_to_expiry(self, expiry_date: date) -> float:
+        """Calculate time to expiry in years."""
+        today = date.today()
+        days_to_expiry = (expiry_date - today).days
+
+        if days_to_expiry < 0:
+            return 0.0
+
+        # Use trading days approximation (calendar days / 365)
+        return days_to_expiry / 365.0
+
     def _calculate_d1(
         self,
         spot: float,
@@ -207,26 +219,27 @@ class GreeksCalculator:
             "vega": 0.0,
             "rho": 0.0
         }
-    
-    def calculate_time_to_expiry(self, expiry_date: date) -> float:
-        """
-        Calculate time to expiry in years.
-        
-        Args:
-            expiry_date: Expiry date of option
-            
-        Returns:
-            Time to expiry in years
-        """
-        from datetime import date as date_class
-        today = date_class.today()
-        days_to_expiry = (expiry_date - today).days
-        
-        if days_to_expiry < 0:
-            return 0.0
-        
-        # Use trading days (252) instead of calendar days for more accuracy
-        return days_to_expiry / 365.0
+
+
+# Backward-compatible functional wrapper
+def calculate_greeks(
+    spot_price: float,
+    strike: float,
+    time_to_expiry: float,
+    volatility: float,
+    option_type: str,
+    risk_free_rate: float = 0.065,
+) -> Dict[str, float]:
+    """Functional wrapper to calculate Greeks (for existing imports)."""
+    calculator = GreeksCalculator(risk_free_rate=risk_free_rate)
+    return calculator.calculate_all(
+        spot_price=spot_price,
+        strike=strike,
+        time_to_expiry=time_to_expiry,
+        volatility=volatility,
+        option_type=option_type,
+        risk_free_rate=risk_free_rate,
+    )
 
 
 def validate_and_calculate_greeks(

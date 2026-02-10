@@ -2,16 +2,23 @@
 
 from .base_agent import BaseAgent
 from .sentinel import Sentinel
-from .strategist import Strategist as StrategistAgent
 from .monk import Monk
 from .trainer import ModelTrainer
-from .engine import TradingEngine
+# from .engine import TradingEngine
+from .data_loader import DataLoader
+from .metrics import calculate_sharpe, calculate_sortino, calculate_var, calculate_cvar, calculate_metrics
+
 
 __all__ = [
     "BaseAgent",
     "Sentinel",
-    "StrategistAgent",
     "Monk",
     "ModelTrainer",
-    "TradingEngine",
+    # "TradingEngine",
+    "DataLoader",
+    "calculate_metrics",
+    "calculate_sharpe",
+    "calculate_sortino",
+    "calculate_var",
+    "calculate_cvar",
 ]

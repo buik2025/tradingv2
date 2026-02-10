@@ -5,9 +5,9 @@ from typing import Optional, Tuple, List
 import pandas as pd
 from loguru import logger
 
-from ..models.regime import RegimePacket, RegimeType
-from ..models.trade import TradeProposal, TradeLeg, LegType, StructureType
-from ..config.constants import NFO
+from ...models.regime import RegimePacket, RegimeType
+from ...models.trade import TradeProposal, TradeLeg, LegType, StructureType
+from ...config.constants import NFO
 
 
 class JadeLizardStrategy:
@@ -40,8 +40,8 @@ class JadeLizardStrategy:
         Jade Lizard is ideal for CAUTION regime (hedged structure).
         Also works in RANGE_BOUND and MEAN_REVERSION.
         """
-        # Regime check - Jade Lizard works in CAUTION (it's hedged)
-        allowed_regimes = [RegimeType.RANGE_BOUND, RegimeType.MEAN_REVERSION, RegimeType.CAUTION]
+        # Regime check - Jade Lizard works in CAUTION (it's hedged) and TREND (directional hedged)
+        allowed_regimes = [RegimeType.RANGE_BOUND, RegimeType.MEAN_REVERSION, RegimeType.CAUTION, RegimeType.TREND]
         if regime.regime not in allowed_regimes:
             return False, f"Regime not suitable: {regime.regime.value}"
         
@@ -101,18 +101,26 @@ class JadeLizardStrategy:
         call_spread_credit = legs[1].entry_price - legs[2].entry_price  # Short call - long call
         net_credit = put_credit + call_spread_credit
         
-        # Max loss is on downside (put strike - net credit)
-        max_loss = (short_put - net_credit) * self.lot_size
+        # Max loss calculation for Jade Lizard:
+        # Downside: Unlimited below short put, but use 2x ATR move as practical max loss
+        # For risk management, use distance from spot to short put as max adverse move
+        downside_distance = regime.spot_price - short_put
+        practical_max_loss = (downside_distance * 2 - net_credit) * self.lot_size  # 2x the OTM distance
+        practical_max_loss = max(practical_max_loss, net_credit * self.lot_size * 2)  # At least 2x credit
         
-        # No upside risk if call spread credit >= distance to short put
-        upside_risk = max(0, (short_call - regime.spot_price) - call_spread_credit) * self.lot_size
+        # Upside risk is capped by the call spread
+        call_spread_width = long_call - short_call
+        upside_max_loss = (call_spread_width - call_spread_credit) * self.lot_size
+        
+        # Use the larger of the two as max loss
+        max_loss = max(practical_max_loss, upside_max_loss)
         
         max_profit = net_credit * self.lot_size
         target_pnl = max_profit * 0.50  # 50% of max profit
         stop_loss = -max_loss * 0.50  # 50% of max loss
         
         greeks = self._calculate_greeks(legs)
-        required_margin = max_loss * 1.5
+        required_margin = max(max_loss, net_credit * self.lot_size * 3)  # Margin based on risk
         
         days_to_expiry = (expiry - date.today()).days
         

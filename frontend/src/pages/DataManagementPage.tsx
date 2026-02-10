@@ -71,8 +71,7 @@ const INTERVALS = [
 export function DataManagementPage() {
   // Historical data state
   const [dataFiles, setDataFiles] = useState<DataFile[]>([]);
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  const [downloadStatus, setDownloadStatus] = useState<DownloadStatus>({
+  const [_downloadStatus, setDownloadStatus] = useState<DownloadStatus>({
     in_progress: false,
     current_symbol: null,
     current_interval: null,

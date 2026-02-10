@@ -1,4 +1,4 @@
-from .models import Base, TradeRecord, PositionRecord, RegimeLog, EventRecord
+from .models import Base, TradeRecord, PositionRecord, RegimeLog, EventRecord, BrokerPosition
 from .repository import Repository
 
 __all__ = [
@@ -7,5 +7,6 @@ __all__ = [
     "PositionRecord",
     "RegimeLog",
     "EventRecord",
+    "BrokerPosition",
     "Repository"
 ]

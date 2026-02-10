@@ -7,9 +7,8 @@ import pandas as pd
 import numpy as np
 from loguru import logger
 
-from .data_loader import DataLoader
-from .metrics import calculate_metrics
-from ..config.thresholds import SLIPPAGE_PCT, BROKERAGE_PCT
+from ..agents import DataLoader
+from ...config.thresholds import SLIPPAGE_PCT, BROKERAGE_PCT
 
 
 @dataclass

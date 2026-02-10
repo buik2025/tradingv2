@@ -9,9 +9,11 @@ from typing import Dict, List, Optional, Any
 from dataclasses import dataclass, asdict
 from loguru import logger
 
-from ..core.kite_client import KiteClient
-from ..config.settings import Settings
-from .pnl_calculator import PnLCalculator
+from ...core.kite_client import KiteClient
+from ...config.settings import Settings
+from ...database.repository import Repository
+from ...database.models import BrokerPosition
+from ..utilities import PnLCalculator
 
 
 @dataclass
@@ -29,11 +31,22 @@ class EnrichedPosition:
     ltp_change_pct: float  # % change from previous close
     pnl: float
     pnl_pct: float
-    product: str
-    source: str
+    product: str  # CNC, NRML, MIS
+    source: str   # LIVE, PAPER
     margin_used: float
     margin_pct: float  # % of total margin
     pnl_on_margin_pct: float
+    # Additional Kite-like fields
+    segment: str = "CASH"  # CASH, NFO, MCX, BFO
+    instrument_type: str = "EQ"  # EQ, FUT, CE, PE
+    underlying: str = ""  # Underlying symbol for derivatives
+    expiry: Optional[str] = None  # Expiry date for derivatives
+    strike: Optional[float] = None  # Strike price for options
+    is_overnight: bool = False  # Overnight position
+    is_short: bool = False  # True short position (derivatives/intraday)
+    is_sold_holding: bool = False  # CNC equity sold from holdings (not true short)
+    position_status: str = "OPEN"  # OPEN or CLOSED (sold holdings are CLOSED)
+    transaction_type: str = "BUY"  # BUY or SELL (for display)
     
     def to_dict(self) -> dict:
         return asdict(self)
@@ -134,6 +147,7 @@ class PortfolioService:
         self.kite = kite
         self._position_cache: Dict[int, EnrichedPosition] = {}
         self._account: Optional[AccountSummary] = None
+        self._repository = Repository()
     
     def get_account_summary(self) -> AccountSummary:
         """Get account margin summary."""
@@ -194,8 +208,6 @@ class PortfolioService:
         result = []
         for p in net_positions:
             qty = p.get("quantity", 0)
-            if qty == 0:
-                continue
             
             instrument_token = p.get("instrument_token", 0)
             tradingsymbol = p.get("tradingsymbol", "")
@@ -207,7 +219,7 @@ class PortfolioService:
             
             # Get margin from lookup or estimate
             position_margin = margin_lookup.get(tradingsymbol, 0)
-            if position_margin == 0:
+            if position_margin == 0 and qty != 0:
                 position_margin = self._estimate_margin(tradingsymbol, exchange, qty, last_price, avg_price, product)
             
             # Calculate percentages
@@ -219,6 +231,19 @@ class PortfolioService:
             close_price = p.get("close_price", 0)
             ltp_change = last_price - close_price if close_price else 0
             ltp_change_pct = (ltp_change / close_price * 100) if close_price else 0
+            
+            # Parse instrument details for derivatives
+            segment = p.get("segment", self._get_segment(exchange))
+            instrument_type, underlying, expiry, strike = self._parse_tradingsymbol(tradingsymbol, exchange)
+            is_overnight = p.get("overnight_quantity", 0) != 0
+            
+            # Determine position status:
+            # qty == 0: position was closed today (intraday closed)
+            # CNC equity with negative qty: sold holding (closed)
+            # Otherwise: open position
+            is_closed_today = (qty == 0)
+            is_sold_holding = (product == "CNC" and instrument_type == "EQ" and qty < 0)
+            is_short = (qty < 0 and not is_sold_holding)
             
             enriched = EnrichedPosition(
                 id=str(instrument_token),
@@ -237,10 +262,25 @@ class PortfolioService:
                 source="LIVE",
                 margin_used=round(position_margin, 2),
                 margin_pct=round(margin_pct, 2),
-                pnl_on_margin_pct=round(pnl_on_margin_pct, 2)
+                pnl_on_margin_pct=round(pnl_on_margin_pct, 2),
+                segment=segment,
+                instrument_type=instrument_type,
+                underlying=underlying,
+                expiry=expiry,
+                strike=strike,
+                is_overnight=is_overnight,
+                is_short=is_short,
+                is_sold_holding=is_sold_holding,
+                position_status="CLOSED" if (is_sold_holding or is_closed_today) else "OPEN",
+                transaction_type="SELL" if (is_short or is_sold_holding) else "BUY"
             )
             result.append(enriched)
             self._position_cache[instrument_token] = enriched
+        
+        # Also fetch paper positions from database (PAPER source only)
+        # Live positions from DB are not fetched here since they come from Kite API above
+        db_positions = self._get_db_positions(total_margin, source="PAPER")
+        result.extend(db_positions)
         
         return result
     
@@ -444,3 +484,157 @@ class PortfolioService:
                 return notional * 0.12
         else:
             return notional * (0.20 if product == "MIS" else 1.0)
+    
+    def _get_segment(self, exchange: str) -> str:
+        """Get segment from exchange."""
+        segment_map = {
+            "NSE": "CASH",
+            "BSE": "CASH",
+            "NFO": "NFO",
+            "BFO": "BFO",
+            "MCX": "MCX",
+            "CDS": "CDS"
+        }
+        return segment_map.get(exchange, "CASH")
+    
+    def _parse_tradingsymbol(self, tradingsymbol: str, exchange: str) -> tuple:
+        """
+        Parse tradingsymbol to extract instrument details.
+        
+        Returns:
+            (instrument_type, underlying, expiry, strike)
+        """
+        import re
+        
+        # Default values for equity
+        if exchange in ("NSE", "BSE"):
+            return ("EQ", tradingsymbol, None, None)
+        
+        # NFO/MCX derivatives parsing
+        # Examples: NIFTY26FEB24900PE, NIFTY26FEBFUT, GOLDM26MARFUT
+        
+        # Option pattern: SYMBOL + YYMMM + STRIKE + CE/PE
+        option_match = re.match(r'^([A-Z]+)(\d{2}[A-Z]{3})(\d+)(CE|PE)$', tradingsymbol)
+        if option_match:
+            underlying = option_match.group(1)
+            expiry = option_match.group(2)
+            strike = float(option_match.group(3))
+            opt_type = option_match.group(4)
+            return (opt_type, underlying, expiry, strike)
+        
+        # Future pattern: SYMBOL + YYMMM + FUT
+        future_match = re.match(r'^([A-Z]+)(\d{2}[A-Z]{3})FUT$', tradingsymbol)
+        if future_match:
+            underlying = future_match.group(1)
+            expiry = future_match.group(2)
+            return ("FUT", underlying, expiry, None)
+        
+        # MCX future pattern: SYMBOLMYYMMM (e.g., GOLDM26MAR)
+        mcx_match = re.match(r'^([A-Z]+)(\d{2}[A-Z]{3})$', tradingsymbol)
+        if mcx_match and exchange == "MCX":
+            underlying = mcx_match.group(1)
+            expiry = mcx_match.group(2)
+            return ("FUT", underlying, expiry, None)
+        
+        # Fallback
+        return ("EQ", tradingsymbol, None, None)
+    
+    def _get_db_positions(self, total_margin: float, source: str = None) -> List[EnrichedPosition]:
+        """
+        Fetch positions from database and enrich them.
+        
+        Args:
+            total_margin: Total margin for percentage calculations
+            source: Filter by source ("PAPER", "LIVE", or None for all)
+        """
+        result = []
+        
+        try:
+            with self._repository._get_session() as session:
+                # Get positions that are not closed
+                query = session.query(BrokerPosition).filter(
+                    BrokerPosition.closed_at.is_(None)
+                )
+                if source:
+                    query = query.filter(BrokerPosition.source == source)
+                
+                db_positions = query.all()
+                
+                if not db_positions:
+                    return result
+                
+                # Get LTP for DB positions
+                tokens = [p.instrument_token for p in db_positions]
+                ltp_data = {}
+                try:
+                    if tokens:
+                        ltp_data = self.kite.get_ltp(tokens)
+                except Exception as e:
+                    logger.warning(f"Failed to get LTP for DB positions: {e}")
+                
+                for p in db_positions:
+                    qty = p.quantity
+                    avg_price = float(p.average_price) if p.average_price else 0
+                    
+                    # Get LTP from API or use average price
+                    ltp_key = f"{p.exchange}:{p.tradingsymbol}"
+                    last_price = ltp_data.get(ltp_key, {}).get("last_price", avg_price)
+                    
+                    # Calculate P&L
+                    if qty > 0:  # Long position
+                        pnl = (last_price - avg_price) * qty
+                    else:  # Short position
+                        pnl = (avg_price - last_price) * abs(qty)
+                    
+                    # Estimate margin for DB positions
+                    position_margin = self._estimate_margin(
+                        p.tradingsymbol, p.exchange, qty, last_price, avg_price, p.product or "NRML"
+                    )
+                    
+                    # Calculate percentages
+                    pnl_pct = (pnl / (avg_price * abs(qty)) * 100) if avg_price and qty else 0
+                    margin_pct = (position_margin / total_margin * 100) if total_margin > 0 else 0
+                    pnl_on_margin_pct = (pnl / position_margin * 100) if position_margin > 0 else 0
+                    
+                    # Parse instrument details
+                    segment = self._get_segment(p.exchange)
+                    instrument_type, underlying, expiry, strike = self._parse_tradingsymbol(p.tradingsymbol, p.exchange)
+                    
+                    is_short = qty < 0
+                    pos_source = p.source or "LIVE"
+                    
+                    enriched = EnrichedPosition(
+                        id=p.id,
+                        tradingsymbol=p.tradingsymbol,
+                        instrument_token=p.instrument_token,
+                        exchange=p.exchange,
+                        quantity=qty,
+                        average_price=round(avg_price, 2),
+                        last_price=round(last_price, 2),
+                        close_price=0.0,
+                        ltp_change=0.0,
+                        ltp_change_pct=0.0,
+                        pnl=round(pnl, 2),
+                        pnl_pct=round(pnl_pct, 2),
+                        product=p.product or "NRML",
+                        source=pos_source,
+                        margin_used=round(position_margin, 2),
+                        margin_pct=round(margin_pct, 2),
+                        pnl_on_margin_pct=round(pnl_on_margin_pct, 2),
+                        segment=segment,
+                        instrument_type=instrument_type,
+                        underlying=underlying,
+                        expiry=expiry,
+                        strike=strike,
+                        is_overnight=False,
+                        is_short=is_short,
+                        is_sold_holding=False,
+                        position_status="OPEN",
+                        transaction_type="SELL" if is_short else "BUY"
+                    )
+                    result.append(enriched)
+                    
+        except Exception as e:
+            logger.error(f"Failed to fetch DB positions: {e}")
+        
+        return result

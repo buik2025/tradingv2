@@ -11,8 +11,8 @@ Ensures both live and backtesting use identical entry rules per v2_rulebook.md
 from typing import List, Tuple
 from loguru import logger
 
-from ..models.regime import RegimePacket, RegimeType
-from ..models.trade import StructureType
+from ...models.regime import RegimePacket, RegimeType
+from ...models.trade import StructureType
 
 
 class StrategySelector:
@@ -265,7 +265,7 @@ class StrategySelector:
         
         # Optional: Liquidity check on option chain if provided
         if option_chain is not None and hasattr(option_chain, 'empty') and not option_chain.empty:
-            from ..config.thresholds import MIN_OPEN_INTEREST
+            from ...config.thresholds import MIN_OPEN_INTEREST
             liquid_strikes = option_chain[option_chain.get('oi', 0) >= MIN_OPEN_INTEREST]
             if len(liquid_strikes) < 5:  # Need at least 5 liquid strikes for spreads
                 return False, f"Insufficient liquid strikes: {len(liquid_strikes)} < 5"
@@ -289,21 +289,35 @@ class StrategySelector:
         if option_chain is None or (hasattr(option_chain, 'empty') and option_chain.empty):
             return option_chain
         
-        from ..config.thresholds import MIN_OPEN_INTEREST, MIN_BID_ASK_SPREAD
+        from ...config.thresholds import MIN_OPEN_INTEREST, MIN_BID_ASK_SPREAD
+        from loguru import logger
         
         min_oi = min_oi or MIN_OPEN_INTEREST
         max_spread = max_spread or MIN_BID_ASK_SPREAD
         
         # Copy to avoid modifying original
         filtered = option_chain.copy()
+        initial_strikes = len(filtered['strike'].unique()) if 'strike' in filtered.columns else 0
         
-        # Filter by open interest
+        # Filter by open interest - skip if all OI values are 0 (data unavailable)
         if 'oi' in filtered.columns:
-            filtered = filtered[filtered['oi'] >= min_oi]
+            oi_sum = filtered['oi'].sum()
+            if oi_sum > 0:  # Only filter if we have OI data
+                filtered = filtered[filtered['oi'] >= min_oi]
+                logger.debug(f"OI filter: {initial_strikes} -> {len(filtered['strike'].unique())} strikes (oi_sum={oi_sum})")
+            else:
+                logger.debug(f"Skipping OI filter (oi_sum=0), keeping {initial_strikes} strikes")
         
-        # Filter by bid-ask spread
+        # Filter by bid-ask spread - skip if all values are 0 (data unavailable)
         if 'bid' in filtered.columns and 'ask' in filtered.columns:
-            filtered['spread'] = filtered['ask'] - filtered['bid']
-            filtered = filtered[filtered['spread'] <= max_spread]
+            bid_sum = filtered['bid'].sum()
+            ask_sum = filtered['ask'].sum()
+            if bid_sum > 0 or ask_sum > 0:
+                filtered['spread'] = filtered['ask'] - filtered['bid']
+                before = len(filtered['strike'].unique())
+                filtered = filtered[filtered['spread'] <= max_spread]
+                logger.debug(f"Spread filter: {before} -> {len(filtered['strike'].unique())} strikes (max_spread={max_spread})")
+            else:
+                logger.debug(f"Skipping spread filter (bid_sum={bid_sum}, ask_sum={ask_sum})")
         
         return filtered

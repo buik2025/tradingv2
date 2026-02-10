@@ -3,23 +3,26 @@
 from datetime import datetime, time
 from typing import Dict, List, Optional, Tuple
 from loguru import logger
+import uuid
 
-from .base_agent import BaseAgent
-from ..core.kite_client import KiteClient
-from ..config.settings import Settings
-from ..config.constants import (
+from ..agents import BaseAgent
+from ...core.kite_client import KiteClient
+from ...core.state_manager import StateManager
+from ...config.settings import Settings
+from ...config.constants import (
     NFO, BUY, SELL, ORDER_TYPE_LIMIT, ORDER_TYPE_MARKET,
     PRODUCT_NRML, PRODUCT_MIS,
     INTRADAY_EXIT_HOUR, INTRADAY_EXIT_MINUTE,
     EXIT_PROFIT_TARGET, EXIT_STOP_LOSS, EXIT_TIME_BASED, EXIT_EOD,
     EXIT_REGIME_CHANGE, EXIT_CIRCUIT_BREAKER
 )
-from ..models.trade import TradeSignal, TradeLeg
-from ..models.order import OrderTicket, ExecutionResult, ExitOrder, OrderStatus, TransactionType, OrderType, ProductType
-from ..models.position import Position, PositionStatus
-from ..models.regime import RegimeType
-from ..database.repository import Repository
-from ..database.models import BrokerPosition
+from ...config.thresholds import SLIPPAGE_ALERT_THRESHOLD, SLIPPAGE_AUTO_CORRECT_THRESHOLD
+from ...models.trade import TradeSignal, TradeLeg
+from ...models.order import OrderTicket, ExecutionResult, ExitOrder, OrderStatus, TransactionType, OrderType, ProductType
+from ...models.position import Position, PositionStatus
+from ...models.regime import RegimeType
+from ...database import Repository, BrokerPosition
+from ...database.models import Strategy, StrategyPosition, Portfolio
 
 
 class Executor(BaseAgent):
@@ -35,11 +38,15 @@ class Executor(BaseAgent):
     - Emergency flatten functionality
     """
     
-    def __init__(self, kite: KiteClient, config: Settings):
+    def __init__(self, kite: KiteClient, config: Settings, state_manager: Optional[StateManager] = None):
         super().__init__(kite, config, name="Executor")
         self._pending_orders: Dict[str, OrderTicket] = {}
         self._positions: Dict[str, Position] = {}
         self.repository = Repository()
+        self.state_manager = state_manager or StateManager()
+        
+        # Slippage tracking (Section 8)
+        self._slippage_alerts: List[Dict] = []
         
         # Load paper positions if in paper mode
         if self.kite.paper_mode:
@@ -87,8 +94,11 @@ class Executor(BaseAgent):
             position = self._create_position(signal, orders)
             if position:
                 self._positions[position.id] = position
+                # Persist position to database (both paper and live)
+                self._persist_position(position)
                 if self.kite.paper_mode:
-                    self._persist_paper_position(position)
+                    # Update paper margin tracking
+                    self._update_paper_margin(signal.approved_margin, add=True)
         else:
             # Rollback successful orders if partial failure
             self._rollback_orders([o for o in orders if o.status == OrderStatus.OPEN])
@@ -158,7 +168,7 @@ class Executor(BaseAgent):
         )
     
     def _wait_for_fills(self, orders: List[OrderTicket], timeout_seconds: int = 30) -> None:
-        """Wait for orders to fill."""
+        """Wait for orders to fill and track slippage."""
         import time as time_module
         
         start = datetime.now()
@@ -177,6 +187,10 @@ class Executor(BaseAgent):
                             order.filled_quantity = latest.get("filled_quantity", order.quantity)
                             order.average_price = latest.get("average_price", order.price)
                             order.filled_at = datetime.now()
+                            
+                            # Track slippage (Section 8)
+                            self._track_slippage(order)
+                            
                         elif status in ["CANCELLED", "REJECTED"]:
                             order.status = OrderStatus(status)
             
@@ -400,7 +414,9 @@ class Executor(BaseAgent):
         position.close(exit_value, exit_order.exit_reason)
         
         if self.kite.paper_mode:
-             self._persist_paper_position(position)
+            self._persist_paper_position(position)
+            # Release margin when position is closed
+            self._update_paper_margin(position.entry_margin, add=False)
         
         result = ExecutionResult(
             signal_id=position.signal_id,
@@ -414,6 +430,11 @@ class Executor(BaseAgent):
         exit_order.realized_pnl = realized_pnl
         exit_order.executed_at = datetime.now()
         exit_order.execution_result = result
+        
+        # Record trade result for consecutive win/loss tracking (Section 6/7)
+        streak_info = self.state_manager.record_trade_result(realized_pnl, position.id)
+        if streak_info.get("actions"):
+            self.logger.info(f"Trade result recorded: {streak_info}")
         
         self.logger.info(f"Exit completed: P&L={realized_pnl:.2f}")
         
@@ -453,36 +474,101 @@ class Executor(BaseAgent):
         # Implementation would reconcile local positions with broker
         pass
 
-    def _persist_paper_position(self, position: Position) -> None:
-        """Persist paper position to database."""
+    def _persist_position(self, position: Position) -> None:
+        """
+        Persist position to database with proper Strategy and Portfolio linkage.
+        
+        Works for both PAPER and LIVE modes. The source field distinguishes them.
+        
+        Creates:
+        1. BrokerPosition records for each leg
+        2. Strategy record to group the legs
+        3. StrategyPosition links between Strategy and BrokerPositions
+        4. Default Portfolio (Paper Trading or Live Trading) if it doesn't exist
+        """
+        source = "PAPER" if self.kite.paper_mode else "LIVE"
+        portfolio_name = "Paper Trading" if self.kite.paper_mode else "Live Trading"
+        
         try:
-            for leg in position.legs:
-                # Map domain leg to DB BrokerPosition
-                # Net quantity logic: positive for long, negative for short
-                qty = leg.quantity if leg.is_long else -leg.quantity
+            with self.repository._get_session() as session:
+                # 1. Get or create default Portfolio for this mode
+                portfolio = session.query(Portfolio).filter_by(
+                    name=portfolio_name
+                ).first()
                 
-                # If position closed, qty is 0 (or we assume flattened)
-                if position.status != PositionStatus.OPEN:
-                    qty = 0
+                if not portfolio:
+                    portfolio = Portfolio(
+                        id=str(uuid.uuid4()),
+                        name=portfolio_name,
+                        description=f"Auto-generated portfolio for {source.lower()} trading positions",
+                        is_active=True
+                    )
+                    session.add(portfolio)
+                    session.flush()
+                    self.logger.info(f"Created {portfolio_name} portfolio: {portfolio.id}")
                 
-                bp = BrokerPosition(
-                     id=f"PAPER_{leg.instrument_token}", # Unique ID for paper pos
-                     tradingsymbol=leg.tradingsymbol,
-                     instrument_token=leg.instrument_token,
-                     exchange=leg.exchange,
-                     quantity=qty,
-                     average_price=leg.entry_price,
-                     last_price=leg.current_price,
-                     pnl=0, # Calculated dynamically by PortfolioService
-                     product="NRML", # Default
-                     transaction_type="BUY" if qty > 0 else "SELL",
-                     source="PAPER",
-                     broker_order_id=f"PAPER_ORD_{leg.instrument_token}"
+                # 2. Create Strategy record
+                strategy_name = f"{position.structure.value} - {position.instrument}"
+                strategy = Strategy(
+                    id=str(uuid.uuid4()),
+                    portfolio_id=portfolio.id,
+                    name=strategy_name,
+                    label=position.structure.value,
+                    primary_instrument=position.instrument,
+                    status="OPEN",
+                    source=source,
+                    notes=f"Auto-created from {source.lower()} trade execution at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+                    tags=[source.lower(), "auto-generated", position.structure.value.lower()]
                 )
-                self.repository.save_broker_position(bp)
-            self.logger.info(f"Persisted paper position {position.id}")
+                session.add(strategy)
+                session.flush()
+                self.logger.info(f"Created strategy: {strategy.id} - {strategy_name} ({source})")
+                
+                # 3. Create BrokerPosition records and link to Strategy
+                broker_position_ids = []
+                for leg in position.legs:
+                    qty = leg.quantity if leg.is_long else -leg.quantity
+                    
+                    if position.status != PositionStatus.OPEN:
+                        qty = 0
+                    
+                    # Use different ID prefix for paper vs live
+                    timestamp = datetime.now().strftime('%Y%m%d%H%M%S%f')
+                    bp_id = f"{source}_{timestamp}_{leg.instrument_token}"
+                    
+                    bp = BrokerPosition(
+                        id=bp_id,
+                        tradingsymbol=leg.tradingsymbol,
+                        instrument_token=leg.instrument_token,
+                        exchange=leg.exchange,
+                        quantity=qty,
+                        average_price=leg.entry_price,
+                        last_price=leg.current_price,
+                        pnl=0,
+                        product="NRML",
+                        transaction_type="BUY" if qty > 0 else "SELL",
+                        source=source,
+                        broker_order_id=leg.broker_order_id if hasattr(leg, 'broker_order_id') else f"{source}_ORD_{leg.instrument_token}"
+                    )
+                    session.add(bp)
+                    broker_position_ids.append(bp_id)
+                
+                session.flush()
+                
+                # 4. Create StrategyPosition links
+                for bp_id in broker_position_ids:
+                    sp = StrategyPosition(
+                        id=str(uuid.uuid4()),
+                        strategy_id=strategy.id,
+                        position_id=bp_id
+                    )
+                    session.add(sp)
+                
+                session.commit()
+                self.logger.info(f"Persisted {source} position {position.id} with strategy {strategy.id}")
+                
         except Exception as e:
-            self.logger.error(f"Failed to persist paper position: {e}")
+            self.logger.error(f"Failed to persist {source} position: {e}")
 
     def _load_positions(self) -> None:
         """Load paper positions from DB (Best effort)."""
@@ -490,3 +576,67 @@ class Executor(BaseAgent):
         # Rehydrating Executor state is complex without strategy metadata.
         # For now, we rely on in-memory state for active management during the session.
         pass
+    
+    def _update_paper_margin(self, margin_amount: float, add: bool = True) -> None:
+        """
+        Update paper trading margin tracking.
+        
+        Args:
+            margin_amount: Amount of margin to add or release
+            add: True to add margin (new position), False to release (closed position)
+        """
+        current_used = self.state_manager.get("paper_used_margin", 0)
+        if add:
+            new_used = current_used + margin_amount
+        else:
+            new_used = max(0, current_used - margin_amount)
+        
+        self.state_manager.set("paper_used_margin", new_used)
+        self.logger.debug(f"Paper margin updated: {current_used:.0f} -> {new_used:.0f} ({'added' if add else 'released'} {margin_amount:.0f})")
+    
+    def _track_slippage(self, order: OrderTicket) -> Dict:
+        """
+        Track slippage for a filled order.
+        
+        Section 8: >0.5% slippage → alert/auto-correct
+        
+        Args:
+            order: Filled order ticket
+            
+        Returns:
+            Dict with slippage info and alert status
+        """
+        if order.price == 0 or order.average_price == 0:
+            return {"slippage_pct": 0, "alert": False}
+        
+        slippage_result = self.state_manager.record_slippage(
+            expected_price=order.price,
+            actual_price=order.average_price,
+            tradingsymbol=order.tradingsymbol,
+            order_id=order.broker_order_id
+        )
+        
+        if slippage_result.get("alert"):
+            self._slippage_alerts.append({
+                "order_id": order.broker_order_id,
+                "tradingsymbol": order.tradingsymbol,
+                "expected": order.price,
+                "actual": order.average_price,
+                "slippage_pct": slippage_result["slippage_pct"],
+                "alert_level": slippage_result["alert_level"],
+                "timestamp": datetime.now()
+            })
+        
+        return slippage_result
+    
+    def get_slippage_alerts(self) -> List[Dict]:
+        """Get recent slippage alerts."""
+        return self._slippage_alerts
+    
+    def get_slippage_summary(self) -> Dict:
+        """Get slippage summary for the day."""
+        return {
+            "total_slippage_today": self.state_manager.get("total_slippage_today", 0),
+            "alert_count": len(self._slippage_alerts),
+            "alerts": self._slippage_alerts[-10:]  # Last 10 alerts
+        }

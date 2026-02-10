@@ -2,7 +2,7 @@
  * Positions Page - Display only, all data comes from backend.
  */
 
-import { useState, useMemo, useEffect, useCallback } from 'react';
+import React, { useState, useMemo, useEffect, useCallback } from 'react';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
@@ -28,6 +28,11 @@ export function PositionsPage() {
   const [searchTerm, setSearchTerm] = useState('');
   const [filterExchange, setFilterExchange] = useState<string>('all');
   const [filterSource, setFilterSource] = useState<'all' | 'LIVE' | 'PAPER'>('all');
+  const [filterProduct, setFilterProduct] = useState<string>('all');
+  const [filterDirection, setFilterDirection] = useState<'all' | 'LONG' | 'SHORT'>('all');
+  const [filterStatus, setFilterStatus] = useState<'all' | 'OPEN' | 'CLOSED'>('OPEN');  // Default to OPEN
+  const [groupBy, setGroupBy] = useState<'none' | 'underlying' | 'expiry'>('none');
+  const [showSettings, setShowSettings] = useState(false);
   const [selectedPositions, setSelectedPositions] = useState<Set<string>>(new Set());
   const [showCreateStrategy, setShowCreateStrategy] = useState(false);
   const [newStrategyName, setNewStrategyName] = useState('');
@@ -110,6 +115,11 @@ export function PositionsPage() {
     [...new Set(positions.map(p => p.exchange))], [positions]
   );
 
+  // Get unique products for filter
+  const uniqueProducts = useMemo(() => 
+    [...new Set(positions.map(p => p.product))], [positions]
+  );
+
   // Only filtering and sorting in frontend - no calculations
   const filteredAndSortedPositions = useMemo(() => {
     let result = [...positions];
@@ -128,6 +138,20 @@ export function PositionsPage() {
       result = result.filter(p => p.source === filterSource);
     }
 
+    if (filterProduct !== 'all') {
+      result = result.filter(p => p.product === filterProduct);
+    }
+
+    if (filterDirection !== 'all') {
+      result = result.filter(p => 
+        filterDirection === 'LONG' ? !p.is_short : p.is_short
+      );
+    }
+
+    if (filterStatus !== 'all') {
+      result = result.filter(p => p.position_status === filterStatus);
+    }
+
     result.sort((a, b) => {
       const aVal = a[sortField];
       const bVal = b[sortField];
@@ -140,7 +164,28 @@ export function PositionsPage() {
     });
 
     return result;
-  }, [positions, searchTerm, filterExchange, sortField, sortDirection]);
+  }, [positions, searchTerm, filterExchange, filterSource, filterProduct, filterDirection, filterStatus, sortField, sortDirection]);
+
+  // Group positions by underlying or expiry
+  const groupedPositions = useMemo(() => {
+    if (groupBy === 'none') return null;
+    
+    const groups: Record<string, { positions: typeof filteredAndSortedPositions; pnl: number }> = {};
+    
+    for (const pos of filteredAndSortedPositions) {
+      const key = groupBy === 'underlying' 
+        ? (pos.underlying || pos.tradingsymbol)
+        : (pos.expiry || 'Equity');
+      
+      if (!groups[key]) {
+        groups[key] = { positions: [], pnl: 0 };
+      }
+      groups[key].positions.push(pos);
+      groups[key].pnl += pos.pnl;
+    }
+    
+    return groups;
+  }, [filteredAndSortedPositions, groupBy]);
 
   const togglePositionSelection = (id: string) => {
     setSelectedPositions(prev => {
@@ -225,8 +270,19 @@ export function PositionsPage() {
       <Card>
         <CardHeader>
           <div className="flex items-center justify-between">
-            <CardTitle>Open Positions ({filteredAndSortedPositions.length})</CardTitle>
+            <CardTitle>
+              {filterStatus === 'OPEN' ? 'Open' : filterStatus === 'CLOSED' ? 'Closed' : 'All'} Positions ({filteredAndSortedPositions.length})
+            </CardTitle>
             <div className="flex items-center gap-4">
+              <select
+                value={filterStatus}
+                onChange={(e) => setFilterStatus(e.target.value as 'all' | 'OPEN' | 'CLOSED')}
+                className="px-3 py-2 text-sm bg-[var(--background)] border border-[var(--border)] rounded-md focus:outline-none font-medium"
+              >
+                <option value="all">All Positions</option>
+                <option value="OPEN">Open Positions</option>
+                <option value="CLOSED">Closed Positions</option>
+              </select>
               <div className="relative">
                 <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 h-4 w-4 text-[var(--muted-foreground)]" />
                 <input
@@ -259,6 +315,61 @@ export function PositionsPage() {
                 <option value="LIVE">Live (Kite)</option>
                 <option value="PAPER">Paper (Simulator)</option>
               </select>
+              <select
+                value={filterProduct}
+                onChange={(e) => setFilterProduct(e.target.value)}
+                className="px-3 py-2 text-sm bg-[var(--background)] border border-[var(--border)] rounded-md focus:outline-none"
+              >
+                <option value="all">All Products</option>
+                {uniqueProducts.map(p => <option key={p} value={p}>{p}</option>)}
+              </select>
+              <select
+                value={filterDirection}
+                onChange={(e) => setFilterDirection(e.target.value as 'all' | 'LONG' | 'SHORT')}
+                className="px-3 py-2 text-sm bg-[var(--background)] border border-[var(--border)] rounded-md focus:outline-none"
+              >
+                <option value="all">All Directions</option>
+                <option value="LONG">Long</option>
+                <option value="SHORT">Short</option>
+              </select>
+              <div className="relative">
+                <Button variant="outline" size="sm" onClick={() => setShowSettings(!showSettings)}>
+                  Settings
+                </Button>
+                {showSettings && (
+                  <div className="absolute right-0 top-full mt-2 w-64 bg-[var(--card)] border border-[var(--border)] rounded-lg shadow-lg p-4 z-50">
+                    <div className="space-y-4">
+                      <div>
+                        <p className="text-sm font-medium mb-2">GROUPING</p>
+                        <div className="space-y-1">
+                          <label className="flex items-center gap-2 text-sm">
+                            <input type="radio" name="groupBy" checked={groupBy === 'none'} onChange={() => setGroupBy('none')} />
+                            None
+                          </label>
+                          <label className="flex items-center gap-2 text-sm">
+                            <input type="radio" name="groupBy" checked={groupBy === 'underlying'} onChange={() => setGroupBy('underlying')} />
+                            Underlying
+                          </label>
+                          <label className="flex items-center gap-2 text-sm">
+                            <input type="radio" name="groupBy" checked={groupBy === 'expiry'} onChange={() => setGroupBy('expiry')} />
+                            Underlying & Expiry
+                          </label>
+                        </div>
+                      </div>
+                      <Button variant="outline" size="sm" className="w-full" onClick={() => {
+                        setFilterExchange('all');
+                        setFilterSource('all');
+                        setFilterProduct('all');
+                        setFilterDirection('all');
+                        setFilterStatus('OPEN');
+                        setGroupBy('none');
+                      }}>
+                        CLEAR
+                      </Button>
+                    </div>
+                  </div>
+                )}
+              </div>
               <Button variant="outline" size="sm" onClick={fetchData} disabled={isRefreshing}>
                 <RefreshCw className={`h-4 w-4 mr-1 ${isRefreshing ? 'animate-spin' : ''}`} />
                 Refresh
@@ -318,58 +429,183 @@ export function PositionsPage() {
                 </tr>
               </thead>
               <tbody>
-                {filteredAndSortedPositions.map((position) => (
-                  <tr 
-                    key={position.id} 
-                    className={`border-b border-[var(--border)] hover:bg-[var(--muted)] ${selectedPositions.has(position.id) ? 'bg-[var(--muted)]/50' : ''}`}
-                  >
-                    <td className="py-3 px-2">
-                      <input
-                        type="checkbox"
-                        checked={selectedPositions.has(position.id)}
-                        onChange={() => togglePositionSelection(position.id)}
-                        className="h-4 w-4 rounded border-[var(--border)]"
-                      />
-                    </td>
-                    <td className="py-3 px-4 font-medium">{position.tradingsymbol}</td>
-                    <td className="py-3 px-4">
-                      <Badge variant="outline">{position.exchange}</Badge>
-                    </td>
-                    <td className="py-3 px-4">
-                      <Badge
-                        variant="outline"
-                        className={
-                          position.source === 'PAPER'
-                            ? 'text-[var(--primary)] border-[var(--primary)]'
-                            : 'text-[var(--muted-foreground)]'
-                        }
-                      >
-                        {position.source === 'PAPER' ? 'Paper' : 'Live'}
-                      </Badge>
-                    </td>
-                    <td className="py-3 px-4 text-right">{position.quantity}</td>
-                    <td className="py-3 px-4 text-right">{formatCurrency(position.average_price)}</td>
-                    <td className="py-3 px-4 text-right">
-                      <div>{formatCurrency(position.last_price)}</div>
-                      <div className={`text-xs ${(position.ltp_change_pct || 0) >= 0 ? 'text-[var(--profit)]' : 'text-[var(--loss)]'}`}>
-                        {(position.ltp_change_pct || 0) >= 0 ? '+' : ''}{formatPercent(position.ltp_change_pct || 0)}
-                      </div>
-                    </td>
-                    <td className={`py-3 px-4 text-right font-medium ${position.pnl >= 0 ? 'text-[var(--profit)]' : 'text-[var(--loss)]'}`}>
-                      {formatCurrency(position.pnl)}
-                    </td>
-                    <td className={`py-3 px-4 text-right ${position.pnl_pct >= 0 ? 'text-[var(--profit)]' : 'text-[var(--loss)]'}`}>
-                      {formatPercent(position.pnl_pct)}
-                    </td>
-                    <td className="py-3 px-4 text-right">
-                      <div>{formatCurrency(position.margin_used)}</div>
-                      <div className="text-xs text-[var(--muted-foreground)]">{formatPercent(position.margin_pct)}</div>
-                    </td>
-                    <td className={`py-3 px-4 text-right font-medium ${position.pnl_on_margin_pct >= 0 ? 'text-[var(--profit)]' : 'text-[var(--loss)]'}`}>
-                      {formatPercent(position.pnl_on_margin_pct)}
-                    </td>
-                  </tr>
-                ))}
+                {groupBy !== 'none' && groupedPositions ? (
+                  // Grouped view
+                  Object.entries(groupedPositions).map(([groupName, group]) => (
+                    <React.Fragment key={`group-${groupName}`}>
+                      {/* Group header row */}
+                      <tr className="bg-[var(--muted)]/30">
+                        <td colSpan={7} className="py-2 px-4 font-medium">
+                          <div className="flex items-center gap-2">
+                            <span>{groupName}</span>
+                            <span className="text-xs text-[var(--muted-foreground)]">({group.positions.length})</span>
+                          </div>
+                        </td>
+                        <td className={`py-2 px-4 text-right font-medium ${group.pnl >= 0 ? 'text-[var(--profit)]' : 'text-[var(--loss)]'}`}>
+                          {formatCurrency(group.pnl)}
+                        </td>
+                        <td colSpan={3}></td>
+                      </tr>
+                      {/* Group positions */}
+                      {group.positions.map((position) => (
+                        <tr 
+                          key={position.id} 
+                          className={`border-b border-[var(--border)] hover:bg-[var(--muted)] ${selectedPositions.has(position.id) ? 'bg-[var(--muted)]/50' : ''}`}
+                        >
+                          <td className="py-3 px-2">
+                            <input
+                              type="checkbox"
+                              checked={selectedPositions.has(position.id)}
+                              onChange={() => togglePositionSelection(position.id)}
+                              className="h-4 w-4 rounded border-[var(--border)]"
+                            />
+                          </td>
+                          <td className="py-3 px-4 pl-8">
+                            <div className="flex items-center gap-2">
+                              <Badge 
+                                variant="outline" 
+                                className={
+                                  position.product === 'CNC' ? 'bg-blue-500/10 text-blue-500 border-blue-500/30' :
+                                  position.product === 'NRML' ? 'bg-orange-500/10 text-orange-500 border-orange-500/30' :
+                                  'bg-purple-500/10 text-purple-500 border-purple-500/30'
+                                }
+                              >
+                                {position.product}
+                              </Badge>
+                              <span className="font-medium">{position.tradingsymbol}</span>
+                              {position.instrument_type !== 'EQ' && (
+                                <span className="text-xs text-[var(--muted-foreground)]">
+                                  {position.instrument_type}
+                                </span>
+                              )}
+                              {position.is_sold_holding && (
+                                <span className="text-xs text-[var(--muted-foreground)]">SOLD HOLDING</span>
+                              )}
+                              {position.is_short && (
+                                <span className="text-xs text-[var(--loss)]">SHORT</span>
+                              )}
+                            </div>
+                          </td>
+                          <td className="py-3 px-4">
+                            <Badge variant="outline">{position.exchange}</Badge>
+                          </td>
+                          <td className="py-3 px-4">
+                            <Badge
+                              variant="outline"
+                              className={
+                                position.source === 'PAPER'
+                                  ? 'text-[var(--primary)] border-[var(--primary)]'
+                                  : 'text-[var(--muted-foreground)]'
+                              }
+                            >
+                              {position.source === 'PAPER' ? 'Paper' : 'Live'}
+                            </Badge>
+                          </td>
+                          <td className="py-3 px-4 text-right">{position.quantity}</td>
+                          <td className="py-3 px-4 text-right">{formatCurrency(position.average_price)}</td>
+                          <td className="py-3 px-4 text-right">
+                            <div>{formatCurrency(position.last_price)}</div>
+                            <div className={`text-xs ${(position.ltp_change_pct || 0) >= 0 ? 'text-[var(--profit)]' : 'text-[var(--loss)]'}`}>
+                              {(position.ltp_change_pct || 0) >= 0 ? '+' : ''}{formatPercent(position.ltp_change_pct || 0)}
+                            </div>
+                          </td>
+                          <td className={`py-3 px-4 text-right font-medium ${position.pnl >= 0 ? 'text-[var(--profit)]' : 'text-[var(--loss)]'}`}>
+                            {formatCurrency(position.pnl)}
+                          </td>
+                          <td className={`py-3 px-4 text-right ${position.pnl_pct >= 0 ? 'text-[var(--profit)]' : 'text-[var(--loss)]'}`}>
+                            {formatPercent(position.pnl_pct)}
+                          </td>
+                          <td className="py-3 px-4 text-right">
+                            <div>{formatCurrency(position.margin_used)}</div>
+                            <div className="text-xs text-[var(--muted-foreground)]">{formatPercent(position.margin_pct)}</div>
+                          </td>
+                          <td className={`py-3 px-4 text-right font-medium ${position.pnl_on_margin_pct >= 0 ? 'text-[var(--profit)]' : 'text-[var(--loss)]'}`}>
+                            {formatPercent(position.pnl_on_margin_pct)}
+                          </td>
+                        </tr>
+                      ))}
+                    </React.Fragment>
+                  ))
+                ) : (
+                  // Flat view (no grouping)
+                  filteredAndSortedPositions.map((position) => (
+                    <tr 
+                      key={position.id} 
+                      className={`border-b border-[var(--border)] hover:bg-[var(--muted)] ${selectedPositions.has(position.id) ? 'bg-[var(--muted)]/50' : ''}`}
+                    >
+                      <td className="py-3 px-2">
+                        <input
+                          type="checkbox"
+                          checked={selectedPositions.has(position.id)}
+                          onChange={() => togglePositionSelection(position.id)}
+                          className="h-4 w-4 rounded border-[var(--border)]"
+                        />
+                      </td>
+                      <td className="py-3 px-4">
+                        <div className="flex items-center gap-2">
+                          <Badge 
+                            variant="outline" 
+                            className={
+                              position.product === 'CNC' ? 'bg-blue-500/10 text-blue-500 border-blue-500/30' :
+                              position.product === 'NRML' ? 'bg-orange-500/10 text-orange-500 border-orange-500/30' :
+                              'bg-purple-500/10 text-purple-500 border-purple-500/30'
+                            }
+                          >
+                            {position.product}
+                          </Badge>
+                          <span className="font-medium">{position.tradingsymbol}</span>
+                          {position.instrument_type !== 'EQ' && (
+                            <span className="text-xs text-[var(--muted-foreground)]">
+                              {position.instrument_type}
+                            </span>
+                          )}
+                          {position.is_sold_holding && (
+                            <span className="text-xs text-[var(--muted-foreground)]">SOLD HOLDING</span>
+                          )}
+                          {position.is_short && (
+                            <span className="text-xs text-[var(--loss)]">SHORT</span>
+                          )}
+                        </div>
+                      </td>
+                      <td className="py-3 px-4">
+                        <Badge variant="outline">{position.exchange}</Badge>
+                      </td>
+                      <td className="py-3 px-4">
+                        <Badge
+                          variant="outline"
+                          className={
+                            position.source === 'PAPER'
+                              ? 'text-[var(--primary)] border-[var(--primary)]'
+                              : 'text-[var(--muted-foreground)]'
+                          }
+                        >
+                          {position.source === 'PAPER' ? 'Paper' : 'Live'}
+                        </Badge>
+                      </td>
+                      <td className="py-3 px-4 text-right">{position.quantity}</td>
+                      <td className="py-3 px-4 text-right">{formatCurrency(position.average_price)}</td>
+                      <td className="py-3 px-4 text-right">
+                        <div>{formatCurrency(position.last_price)}</div>
+                        <div className={`text-xs ${(position.ltp_change_pct || 0) >= 0 ? 'text-[var(--profit)]' : 'text-[var(--loss)]'}`}>
+                          {(position.ltp_change_pct || 0) >= 0 ? '+' : ''}{formatPercent(position.ltp_change_pct || 0)}
+                        </div>
+                      </td>
+                      <td className={`py-3 px-4 text-right font-medium ${position.pnl >= 0 ? 'text-[var(--profit)]' : 'text-[var(--loss)]'}`}>
+                        {formatCurrency(position.pnl)}
+                      </td>
+                      <td className={`py-3 px-4 text-right ${position.pnl_pct >= 0 ? 'text-[var(--profit)]' : 'text-[var(--loss)]'}`}>
+                        {formatPercent(position.pnl_pct)}
+                      </td>
+                      <td className="py-3 px-4 text-right">
+                        <div>{formatCurrency(position.margin_used)}</div>
+                        <div className="text-xs text-[var(--muted-foreground)]">{formatPercent(position.margin_pct)}</div>
+                      </td>
+                      <td className={`py-3 px-4 text-right font-medium ${position.pnl_on_margin_pct >= 0 ? 'text-[var(--profit)]' : 'text-[var(--loss)]'}`}>
+                        {formatPercent(position.pnl_on_margin_pct)}
+                      </td>
+                    </tr>
+                  ))
+                )}
               </tbody>
             </table>
           </div>

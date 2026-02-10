@@ -11,11 +11,9 @@ from ..config.constants import NIFTY_TOKEN, MARKET_OPEN_HOUR, MARKET_CLOSE_HOUR
 from ..core.kite_client import KiteClient
 from ..core.data_cache import DataCache
 from ..core.state_manager import StateManager
-from ..services.sentinel import Sentinel
-from ..services.strategist import Strategist
-from ..services.treasury import Treasury
-from ..services.executor import Executor
-from ..services.monk import Monk
+from ..services.agents import Sentinel, Monk
+from ..services.strategies import Strategist
+from ..services.execution import Treasury, Executor
 from ..database.repository import Repository
 from ..database.models import RegimeLog
 
@@ -55,11 +53,11 @@ class Orchestrator:
         self.state_manager = StateManager(config.state_dir)
         self.repository = Repository()  # Uses PostgreSQL from DATABASE_URL
         
-        # Initialize agents
+        # Initialize agents - share state_manager for consistent margin tracking
         self.sentinel = Sentinel(self.kite, config, self.data_cache)
         self.strategist = Strategist(self.kite, config)
-        self.treasury = Treasury(self.kite, config, self.state_manager)
-        self.executor = Executor(self.kite, config)
+        self.treasury = Treasury(self.kite, config, self.state_manager, paper_mode=(mode == "paper"))
+        self.executor = Executor(self.kite, config, self.state_manager)
         self.monk = Monk(self.kite, config, config.models_dir)
         
         logger.info(f"Orchestrator initialized in {mode.upper()} mode")
@@ -67,28 +65,36 @@ class Orchestrator:
     async def run(self, interval_seconds: int = 30):
         """Main trading loop."""
         self.running = True
-        logger.info("Starting trading loop")
+        logger.info(f"Starting trading loop (interval={interval_seconds}s)")
         
-        self.state_manager.reset_daily()
+        try:
+            self.state_manager.reset_daily()
+        except Exception as e:
+            logger.error(f"Failed to reset daily state: {e}")
         
+        iteration_count = 0
         while self.running:
             try:
-                if not self._is_market_hours():
+                is_market = self._is_market_hours()
+                if not is_market:
                     logger.debug("Outside market hours, waiting...")
                     await asyncio.sleep(60)
                     continue
                 
+                iteration_count += 1
+                logger.info(f"Starting iteration #{iteration_count}")
                 await self._run_iteration()
+                logger.info(f"Completed iteration #{iteration_count}, sleeping {interval_seconds}s")
                 await asyncio.sleep(interval_seconds)
                 
             except asyncio.CancelledError:
                 logger.info("Trading loop cancelled")
                 break
             except Exception as e:
-                logger.error(f"Error in main loop: {e}")
+                logger.error(f"Error in main loop iteration #{iteration_count}: {e}", exc_info=True)
                 await asyncio.sleep(60)
         
-        logger.info("Trading loop stopped")
+        logger.info(f"Trading loop stopped after {iteration_count} iterations")
     
     async def _run_iteration(self):
         """Run one iteration of the trading loop."""
@@ -135,6 +141,11 @@ class Orchestrator:
         
         # 5. Strategist: Generate signals
         proposals = self.strategist.process(regime)
+        logger.info(f"Strategist generated {len(proposals)} proposals")
+        
+        if not proposals:
+            logger.info("No proposals generated - check entry window and strategy conditions")
+            return
         
         for proposal in proposals:
             logger.info(f"Proposal: {proposal.structure.value} on {proposal.instrument}")
@@ -145,12 +156,9 @@ class Orchestrator:
             if approved and signal:
                 logger.info(f"Approved: {reason}")
                 
-                # 7. Executor: Place order
-                if self.mode == "live":
-                    result = self.executor.process(signal)
-                    logger.info(f"Execution: {'SUCCESS' if result.success else 'FAILED'}")
-                else:
-                    logger.info("[PAPER] Would execute signal")
+                # 7. Executor: Place order (both live and paper mode)
+                result = self.executor.process(signal)
+                logger.info(f"Execution ({self.mode.upper()}): {'SUCCESS' if result.success else 'FAILED'}")
             else:
                 logger.info(f"Rejected: {reason}")
     

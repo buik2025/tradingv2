@@ -5,9 +5,9 @@ from typing import Optional, Tuple, List
 import pandas as pd
 from loguru import logger
 
-from ..models.regime import RegimePacket, RegimeType
-from ..models.trade import TradeProposal, TradeLeg, LegType, StructureType
-from ..config.constants import NFO
+from ...models.regime import RegimePacket, RegimeType
+from ...models.trade import TradeProposal, TradeLeg, LegType, StructureType
+from ...config.constants import NFO
 
 
 class ButterflyStrategy:

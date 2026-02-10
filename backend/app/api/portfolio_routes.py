@@ -11,7 +11,7 @@ from loguru import logger
 
 from ..core.kite_client import KiteClient, TokenExpiredException
 from ..config.settings import Settings
-from ..services.portfolio_service import PortfolioService
+from ..services.execution import PortfolioService
 from .auth import get_access_token
 
 
@@ -33,11 +33,22 @@ class PositionResponse(BaseModel):
     ltp_change_pct: float
     pnl: float
     pnl_pct: float
-    product: str
-    source: str
+    product: str  # CNC, NRML, MIS
+    source: str   # LIVE, PAPER
     margin_used: float
     margin_pct: float
     pnl_on_margin_pct: float
+    # Kite-like categorization fields
+    segment: str = "CASH"  # CASH, NFO, MCX, BFO
+    instrument_type: str = "EQ"  # EQ, FUT, CE, PE
+    underlying: str = ""  # Underlying symbol for derivatives
+    expiry: Optional[str] = None  # Expiry date for derivatives
+    strike: Optional[float] = None  # Strike price for options
+    is_overnight: bool = False
+    is_short: bool = False  # True short (derivatives/intraday)
+    is_sold_holding: bool = False  # CNC equity sold from holdings
+    position_status: str = "OPEN"  # OPEN or CLOSED
+    transaction_type: str = "BUY"  # BUY or SELL
 
 
 class TradeResponse(BaseModel):

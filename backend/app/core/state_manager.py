@@ -42,7 +42,16 @@ class StateManager:
             "open_position_ids": [],
             "circuit_breaker_active": False,
             "circuit_breaker_reason": None,
-            "trading_day_start": None
+            "trading_day_start": None,
+            # Trade history for consecutive losers/winners (Section 6/7)
+            "recent_trade_results": [],  # List of recent trade P&L results
+            "consecutive_losers": 0,
+            "consecutive_winners": 0,
+            "losers_reduction_active": False,
+            "win_streak_cap_active": False,
+            # Slippage tracking (Section 8)
+            "slippage_alerts": [],  # Recent slippage alerts
+            "total_slippage_today": 0.0
         }
     
     def save(self) -> None:
@@ -125,3 +134,159 @@ class StateManager:
             self._state["high_watermark"] = equity
             self.save()
             logger.info(f"New high watermark: {equity}")
+    
+    def record_trade_result(self, pnl: float, trade_id: str = None) -> Dict[str, Any]:
+        """
+        Record a trade result and update consecutive win/loss tracking.
+        
+        Section 6: 3 consecutive losers → 50% reduction + 1 flat day
+        Section 7: Win streak → cap sizing at 80%
+        
+        Returns:
+            Dict with current streak info and any triggered actions
+        """
+        from ..config.thresholds import (
+            CONSECUTIVE_LOSERS_THRESHOLD, CONSECUTIVE_LOSERS_FLAT_DAYS,
+            WIN_STREAK_THRESHOLD
+        )
+        
+        result = {
+            "trade_id": trade_id,
+            "pnl": pnl,
+            "timestamp": datetime.now().isoformat(),
+            "is_winner": pnl > 0
+        }
+        
+        # Add to recent results (keep last 10)
+        recent = self._state.get("recent_trade_results", [])
+        recent.append(result)
+        if len(recent) > 10:
+            recent = recent[-10:]
+        self._state["recent_trade_results"] = recent
+        
+        # Update consecutive counters
+        if pnl > 0:
+            # Winner
+            self._state["consecutive_winners"] = self._state.get("consecutive_winners", 0) + 1
+            self._state["consecutive_losers"] = 0
+            self._state["losers_reduction_active"] = False
+        else:
+            # Loser
+            self._state["consecutive_losers"] = self._state.get("consecutive_losers", 0) + 1
+            self._state["consecutive_winners"] = 0
+            self._state["win_streak_cap_active"] = False
+        
+        actions = {}
+        
+        # Check for 3 consecutive losers
+        if self._state["consecutive_losers"] >= CONSECUTIVE_LOSERS_THRESHOLD:
+            self._state["losers_reduction_active"] = True
+            self.activate_circuit_breaker(
+                f"{CONSECUTIVE_LOSERS_THRESHOLD} consecutive losers",
+                CONSECUTIVE_LOSERS_FLAT_DAYS
+            )
+            actions["consecutive_losers_triggered"] = True
+            actions["flat_days"] = CONSECUTIVE_LOSERS_FLAT_DAYS
+            logger.warning(f"CONSECUTIVE LOSERS: {self._state['consecutive_losers']} losers, activating 50% reduction")
+        
+        # Check for win streak cap
+        if self._state["consecutive_winners"] >= WIN_STREAK_THRESHOLD:
+            self._state["win_streak_cap_active"] = True
+            actions["win_streak_cap_triggered"] = True
+            logger.info(f"WIN STREAK: {self._state['consecutive_winners']} wins, capping size at 80%")
+        
+        self.save()
+        
+        return {
+            "consecutive_losers": self._state["consecutive_losers"],
+            "consecutive_winners": self._state["consecutive_winners"],
+            "losers_reduction_active": self._state["losers_reduction_active"],
+            "win_streak_cap_active": self._state["win_streak_cap_active"],
+            "actions": actions
+        }
+    
+    def get_sizing_multiplier(self) -> float:
+        """
+        Get position sizing multiplier based on consecutive win/loss state.
+        
+        Returns:
+            Multiplier to apply to position size (0.5 for losers, 0.8 for win cap)
+        """
+        from ..config.thresholds import (
+            CONSECUTIVE_LOSERS_REDUCTION, WIN_STREAK_SIZE_CAP
+        )
+        
+        if self._state.get("losers_reduction_active", False):
+            return CONSECUTIVE_LOSERS_REDUCTION
+        
+        if self._state.get("win_streak_cap_active", False):
+            return WIN_STREAK_SIZE_CAP
+        
+        return 1.0
+    
+    def record_slippage(self, expected_price: float, actual_price: float, 
+                        tradingsymbol: str, order_id: str = None) -> Dict[str, Any]:
+        """
+        Record slippage and generate alerts if threshold exceeded.
+        
+        Section 8: >0.5% slippage → alert/auto-correct
+        
+        Returns:
+            Dict with slippage info and alert status
+        """
+        from ..config.thresholds import (
+            SLIPPAGE_ALERT_THRESHOLD, SLIPPAGE_AUTO_CORRECT_THRESHOLD
+        )
+        
+        if expected_price == 0:
+            return {"slippage_pct": 0, "alert": False}
+        
+        slippage_pct = abs(actual_price - expected_price) / expected_price
+        
+        alert_data = {
+            "timestamp": datetime.now().isoformat(),
+            "tradingsymbol": tradingsymbol,
+            "order_id": order_id,
+            "expected_price": expected_price,
+            "actual_price": actual_price,
+            "slippage_pct": slippage_pct,
+            "alert_level": None
+        }
+        
+        # Update daily slippage total
+        self._state["total_slippage_today"] = self._state.get("total_slippage_today", 0) + slippage_pct
+        
+        # Check thresholds
+        if slippage_pct >= SLIPPAGE_AUTO_CORRECT_THRESHOLD:
+            alert_data["alert_level"] = "CRITICAL"
+            logger.error(
+                f"SLIPPAGE CRITICAL: {tradingsymbol} slippage {slippage_pct:.2%} "
+                f"(expected={expected_price:.2f}, actual={actual_price:.2f})"
+            )
+        elif slippage_pct >= SLIPPAGE_ALERT_THRESHOLD:
+            alert_data["alert_level"] = "WARNING"
+            logger.warning(
+                f"SLIPPAGE WARNING: {tradingsymbol} slippage {slippage_pct:.2%} "
+                f"(expected={expected_price:.2f}, actual={actual_price:.2f})"
+            )
+        
+        # Store alert if threshold exceeded
+        if alert_data["alert_level"]:
+            alerts = self._state.get("slippage_alerts", [])
+            alerts.append(alert_data)
+            if len(alerts) > 50:  # Keep last 50 alerts
+                alerts = alerts[-50:]
+            self._state["slippage_alerts"] = alerts
+            self.save()
+        
+        return {
+            "slippage_pct": slippage_pct,
+            "alert": alert_data["alert_level"] is not None,
+            "alert_level": alert_data["alert_level"],
+            "total_slippage_today": self._state["total_slippage_today"]
+        }
+    
+    def reset_slippage_daily(self) -> None:
+        """Reset daily slippage tracking."""
+        self._state["total_slippage_today"] = 0.0
+        self.save()

@@ -5,9 +5,9 @@ from typing import Optional, Tuple, List
 import pandas as pd
 from loguru import logger
 
-from ..models.regime import RegimePacket, RegimeType
-from ..models.trade import TradeProposal, TradeLeg, LegType, StructureType
-from ..config.constants import NFO
+from ...models.regime import RegimePacket, RegimeType
+from ...models.trade import TradeProposal, TradeLeg, LegType, StructureType
+from ...config.constants import NFO
 
 
 class RiskReversalStrategy:
@@ -28,9 +28,11 @@ class RiskReversalStrategy:
     - IV not too high (avoid overpaying for long option)
     """
     
-    def __init__(self, lot_size: int = 50):
+    def __init__(self, kite=None, lot_size: int = 50):
+        self.kite = kite
         self.lot_size = lot_size
         self.name = "RISK_REVERSAL"
+        self.logger = logger
     
     def check_entry_conditions(self, regime: RegimePacket) -> Tuple[bool, str, str]:
         """
@@ -39,9 +41,10 @@ class RiskReversalStrategy:
         Returns:
             Tuple of (conditions_met, reason, direction)
         """
-        # Regime check
-        if regime.regime != RegimeType.MEAN_REVERSION:
-            return False, f"Regime not MEAN_REVERSION: {regime.regime.value}", ""
+        # Regime check - Risk Reversal works in MEAN_REVERSION and TREND
+        allowed_regimes = [RegimeType.MEAN_REVERSION, RegimeType.TREND]
+        if regime.regime not in allowed_regimes:
+            return False, f"Regime not suitable: {regime.regime.value}", ""
         
         # Safety check
         if not regime.is_safe:
@@ -55,13 +58,21 @@ class RiskReversalStrategy:
         if regime.event_flag:
             return False, f"Event blackout: {regime.event_name}", ""
         
-        # Determine direction from RSI
-        if regime.metrics.rsi < 30:
-            return True, "Bullish reversal setup", "BULLISH"
-        elif regime.metrics.rsi > 70:
-            return True, "Bearish reversal setup", "BEARISH"
+        # Determine direction from RSI or ADX trend
+        if regime.regime == RegimeType.TREND:
+            # In TREND regime, use RSI to determine direction (>50 = bullish, <50 = bearish)
+            if regime.metrics.rsi >= 50:
+                return True, "Bullish trend setup (ADX high, RSI bullish)", "BULLISH"
+            else:
+                return True, "Bearish trend setup (ADX high, RSI bearish)", "BEARISH"
         else:
-            return False, f"RSI not extreme: {regime.metrics.rsi:.1f}", ""
+            # MEAN_REVERSION: require extreme RSI
+            if regime.metrics.rsi < 30:
+                return True, "Bullish reversal setup", "BULLISH"
+            elif regime.metrics.rsi > 70:
+                return True, "Bearish reversal setup", "BEARISH"
+            else:
+                return False, f"RSI not extreme: {regime.metrics.rsi:.1f}", ""
     
     def generate_proposal(
         self,

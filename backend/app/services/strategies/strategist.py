@@ -6,14 +6,14 @@ import pandas as pd
 import numpy as np
 from loguru import logger
 
-from .base_agent import BaseAgent
-from ..core.kite_client import KiteClient
-from ..config.settings import Settings
-from ..config.constants import (
+from ..agents.base_agent import BaseAgent
+from ...core.kite_client import KiteClient
+from ...config.settings import Settings
+from ...config.constants import (
     ENTRY_START_HOUR, ENTRY_START_MINUTE, ENTRY_END_HOUR, ENTRY_END_MINUTE,
     NFO, BUY, SELL
 )
-from ..config.thresholds import (
+from ...config.thresholds import (
     IV_PERCENTILE_SHORT_VOL, IV_PERCENTILE_STRANGLE,
     IC_SHORT_DELTA, IC_LONG_DELTA,
     IC_PROFIT_TARGET, IC_STOP_LOSS, IC_MIN_DTE, IC_MAX_DTE,
@@ -21,18 +21,18 @@ from ..config.thresholds import (
     MIN_BID_ASK_SPREAD, MIN_OPEN_INTEREST,
     RSI_OVERSOLD, RSI_OVERBOUGHT
 )
-from ..models.regime import RegimePacket, RegimeType
-from ..models.trade import TradeProposal, TradeLeg, LegType, StructureType
+from ...models.regime import RegimePacket, RegimeType
+from ...models.trade import TradeProposal, TradeLeg, LegType, StructureType
 from .iron_condor import IronCondorStrategy
 from .jade_lizard import JadeLizardStrategy
 from .butterfly import ButterflyStrategy, BrokenWingButterflyStrategy
 from .risk_reversal import RiskReversalStrategy
 from .strangle import StrangleStrategy
-from .technical import (
+from ..indicators.technical import (
     calculate_adx, calculate_rsi, calculate_atr, calculate_day_range,
     calculate_bollinger_band_width, calculate_bbw_ratio, calculate_volume_ratio
 )
-from .greeks import validate_and_calculate_greeks, GreeksCalculator
+from ..indicators.greeks import validate_and_calculate_greeks, GreeksCalculator
 
 
 class Strategist(BaseAgent):
@@ -83,7 +83,7 @@ class Strategist(BaseAgent):
             List of TradeProposal objects, ranked by suitability
         """
         from .strategy_selector import StrategySelector
-        from ..models.trade import StructureType
+        from ...models.trade import StructureType
         
         proposals = []
         

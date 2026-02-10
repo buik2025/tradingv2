@@ -1,5 +1,5 @@
 {
-  "last_updated": "2026-02-08T10:07:30.779405",
+  "last_updated": "2026-02-10T15:23:32.303394",
   "high_watermark": 0.0,
   "daily_pnl": 0.0,
   "weekly_pnl": 0.0,
@@ -9,5 +9,6 @@
   "open_position_ids": [],
   "circuit_breaker_active": false,
   "circuit_breaker_reason": null,
-  "trading_day_start": "2026-02-08"
+  "trading_day_start": "2026-02-10",
+  "paper_used_margin": 696239.9999999988
 }

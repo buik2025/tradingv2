@@ -21,6 +21,11 @@ from ..database.models import (
     BrokerPosition, Strategy, StrategyPosition, Portfolio, get_session
 )
 
+from ..core.kite_client import KiteClient
+from ..config.settings import Settings
+from .auth import get_any_valid_access_token
+from ..services.utilities import InstrumentCache, PnLCalculator
+
 
 router = APIRouter()
 
@@ -53,6 +58,7 @@ class KiteTickerManager:
         self._thread = None
         self._access_token = None
         self._api_key = None
+        self._instrument_cache = InstrumentCache()
         logger.info("KiteTickerManager initialized")
     
     def add_callback(self, callback: callable):
@@ -557,11 +563,13 @@ async def websocket_endpoint(websocket: WebSocket):
             access_token = get_any_valid_access_token() or config.kite_access_token
             
             if access_token:
+                logger.info(f"Starting ticker for {len(positions)} positions")
                 ticker_manager.start(config.kite_api_key, access_token)
                 ticker_manager.add_callback(on_tick)
                 
                 # Subscribe to all position tokens
                 tokens = [p.get("instrument_token") for p in positions if p.get("instrument_token")]
+                logger.info(f"Subscribing to {len(tokens)} tokens: {tokens}")
                 ticker_manager.subscribe(tokens)
         
         # Fetch strategies and portfolios with initial position data
@@ -585,7 +593,7 @@ async def websocket_endpoint(websocket: WebSocket):
             receive_messages(),
             process_ticks(),
             send_heartbeat(),
-            return_exceptions=True
+            return_exceptions=True,
         )
                 
     except WebSocketDisconnect:
@@ -602,11 +610,6 @@ def fetch_positions_once() -> list:
     
     Also refreshes instrument cache for accurate P&L calculations.
     """
-    from ..core.kite_client import KiteClient
-    from ..config.settings import Settings
-    from .auth import get_any_valid_access_token
-    from ..services.instrument_cache import instrument_cache
-    from ..services.pnl_calculator import PnLCalculator
     
     config = Settings()
     access_token = get_any_valid_access_token() or config.kite_access_token
@@ -623,7 +626,8 @@ def fetch_positions_once() -> list:
         )
         
         # Refresh instrument cache (will skip if recently refreshed)
-        instrument_cache.refresh_from_kite(kite)
+        cache = InstrumentCache()
+        cache.refresh_from_kite(kite)
         
         positions_data = kite.get_positions()
         net_positions = positions_data.get("net", [])
@@ -649,7 +653,7 @@ def fetch_positions_once() -> list:
             )
             
             # Get instrument info for additional context
-            inst_info = instrument_cache.get(instrument_token) or {}
+            inst_info = cache.get(instrument_token) or {}
             
             # Calculate LTP change from previous close
             close_price = p.get("close_price", 0)
@@ -786,7 +790,7 @@ def update_positions_with_ticks(positions: list, ticks: list) -> list:
     Backend is the source of truth for P&L calculations.
     Uses PnLCalculator for correct calculations across all instrument types.
     """
-    from ..services.pnl_calculator import PnLCalculator
+    from ..services.utilities import PnLCalculator
     
     # Create lookup by token
     tick_map = {t.get("instrument_token"): t for t in ticks}

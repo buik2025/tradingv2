@@ -5,8 +5,8 @@ from typing import Any, Optional
 from datetime import datetime
 from loguru import logger
 
-from ..core.kite_client import KiteClient
-from ..config.settings import Settings
+from ...core.kite_client import KiteClient
+from ...config.settings import Settings
 
 
 class BaseAgent(ABC):

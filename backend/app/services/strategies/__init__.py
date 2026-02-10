@@ -4,7 +4,7 @@ from .strategy_selector import StrategySelector
 from .strategist import Strategist
 from .iron_condor import IronCondorStrategy
 from .jade_lizard import JadeLizardStrategy
-from .butterfly import IronButterflyStrategy, BrokenWingButterflyStrategy
+from .butterfly import BrokenWingButterflyStrategy
 from .risk_reversal import RiskReversalStrategy
 from .strangle import StrangleStrategy
 
@@ -13,7 +13,6 @@ __all__ = [
     "Strategist",
     "IronCondorStrategy",
     "JadeLizardStrategy",
-    "IronButterflyStrategy",
     "BrokenWingButterflyStrategy",
     "RiskReversalStrategy",
     "StrangleStrategy",

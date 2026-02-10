@@ -20,11 +20,22 @@ export interface Position {
   ltp_change_pct: number;
   pnl: number;
   pnl_pct: number;
-  product: string;
-  source: string;
+  product: string;  // CNC, NRML, MIS
+  source: string;   // LIVE, PAPER
   margin_used: number;
   margin_pct: number;
   pnl_on_margin_pct: number;
+  // Kite-like categorization fields
+  segment: string;  // CASH, NFO, MCX, BFO
+  instrument_type: string;  // EQ, FUT, CE, PE
+  underlying: string;  // Underlying symbol for derivatives
+  expiry?: string;  // Expiry date for derivatives
+  strike?: number;  // Strike price for options
+  is_overnight: boolean;
+  is_short: boolean;  // True short (derivatives/intraday)
+  is_sold_holding: boolean;  // CNC equity sold from holdings
+  position_status: string;  // OPEN or CLOSED
+  transaction_type: string;  // BUY or SELL
 }
 
 export interface Trade {

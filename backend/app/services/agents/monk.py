@@ -9,8 +9,8 @@ import numpy as np
 from loguru import logger
 
 from .base_agent import BaseAgent
-from ..core.kite_client import KiteClient
-from ..config.settings import Settings
+from ...core.kite_client import KiteClient
+from ...config.settings import Settings
 
 
 class Monk(BaseAgent):
