@@ -13,23 +13,34 @@ import os
 
 Base = declarative_base()
 
-# Database URL - defaults to PostgreSQL
-DATABASE_URL = os.getenv(
-    "DATABASE_URL", 
-    "postgresql://postgres:postgres@localhost:5432/trading"
-)
+# Database URL - MUST be set via environment variable in production
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    # Only allow default in development
+    import warnings
+    warnings.warn(
+        "DATABASE_URL not set. Using default PostgreSQL connection. "
+        "Set DATABASE_URL environment variable for production!",
+        UserWarning
+    )
+    DATABASE_URL = "postgresql://postgres:postgres@localhost:5432/trading"
 
 
 class KiteCredentials(Base):
-    """Store Kite API credentials - only keeps latest record."""
+    """Store Kite API credentials - only keeps latest record.
+    
+    SECURITY: api_secret and access_token are stored ENCRYPTED.
+    Use get_api_secret() and get_access_token() methods to decrypt.
+    Use set_api_secret() and set_access_token() methods to encrypt before saving.
+    """
     __tablename__ = "kite_credentials"
     
     id = Column(Integer, primary_key=True, autoincrement=True)
     
-    # Credentials
+    # Credentials - api_key is not secret, others are encrypted
     api_key = Column(String(50), nullable=False)
-    api_secret = Column(String(50), nullable=False)
-    access_token = Column(String(100), nullable=False)
+    api_secret_encrypted = Column(String(500), nullable=False)  # Encrypted
+    access_token_encrypted = Column(String(500), nullable=False)  # Encrypted
     
     # User info from Kite
     user_id = Column(String(50))
@@ -43,6 +54,43 @@ class KiteCredentials(Base):
     
     # Status
     is_valid = Column(Boolean, default=True)
+    
+    def get_api_secret(self) -> str:
+        """Decrypt and return API secret."""
+        from ..core.encryption import decrypt_credential
+        return decrypt_credential(self.api_secret_encrypted)
+    
+    def set_api_secret(self, plaintext: str) -> None:
+        """Encrypt and store API secret."""
+        from ..core.encryption import encrypt_credential
+        self.api_secret_encrypted = encrypt_credential(plaintext)
+    
+    def get_access_token(self) -> str:
+        """Decrypt and return access token."""
+        from ..core.encryption import decrypt_credential
+        return decrypt_credential(self.access_token_encrypted)
+    
+    def set_access_token(self, plaintext: str) -> None:
+        """Encrypt and store access token."""
+        from ..core.encryption import encrypt_credential
+        self.access_token_encrypted = encrypt_credential(plaintext)
+    
+    @classmethod
+    def create_encrypted(
+        cls,
+        api_key: str,
+        api_secret: str,
+        access_token: str,
+        **kwargs
+    ) -> 'KiteCredentials':
+        """Factory method to create credentials with encryption."""
+        from ..core.encryption import encrypt_credential
+        return cls(
+            api_key=api_key,
+            api_secret_encrypted=encrypt_credential(api_secret),
+            access_token_encrypted=encrypt_credential(access_token),
+            **kwargs
+        )
 
 
 class TradeRecord(Base):
@@ -286,6 +334,17 @@ class Strategy(Base):
     closed_at = Column(DateTime)
     close_reason = Column(String(100))
     
+    # Trailing Stop Configuration
+    trailing_stop_enabled = Column(Boolean, default=False)
+    trailing_activation_pct = Column(Numeric(6, 3), default=0.8)  # Activate at 0.8% of margin
+    trailing_step_pct = Column(Numeric(6, 3), default=0.1)  # Step size for P&L increase
+    trailing_lock_pct = Column(Numeric(6, 3), default=0.05)  # Lock in 0.05% per step
+    trailing_current_floor_pct = Column(Numeric(6, 3))  # Current locked-in profit floor %
+    trailing_high_water_pct = Column(Numeric(6, 3))  # Highest P&L % reached
+    trailing_margin_used = Column(Numeric(14, 2))  # Margin at time of activation
+    trailing_activated_at = Column(DateTime)  # When trailing was activated
+    trailing_sl_order_ids = Column(JSON)  # List of SL order IDs placed
+    
     # Timestamps
     created_at = Column(DateTime, default=datetime.now)
     updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
@@ -527,6 +586,48 @@ class StrategyPerformance(Base):
 # Database engine and session
 _engine = None
 _SessionLocal = None
+
+
+class ExecutionAuditLog(Base):
+    """Detailed audit trail for all execution events."""
+    __tablename__ = "execution_audit_log"
+    
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    event_id = Column(String(50), unique=True, nullable=False, index=True)
+    timestamp = Column(DateTime, default=datetime.now, index=True)
+    event_type = Column(String(50), nullable=False, index=True)
+    
+    # Correlation
+    correlation_id = Column(String(50), nullable=False, index=True)
+    agent = Column(String(50), nullable=False)
+    
+    # Trade context
+    trade_id = Column(String(100), index=True)
+    position_id = Column(String(100), index=True)
+    order_id = Column(String(100), index=True)
+    
+    # Instrument
+    instrument = Column(String(100))
+    instrument_token = Column(Integer)
+    
+    # Details as JSON
+    details = Column(JSON)
+    
+    # Regime context
+    regime = Column(String(50))
+    regime_confidence = Column(Float)
+    
+    # Pricing
+    price = Column(Float)
+    quantity = Column(Integer)
+    
+    # P&L
+    pnl = Column(Float)
+    pnl_pct = Column(Float)
+    
+    # Status
+    success = Column(Boolean, default=True)
+    error_message = Column(Text)
 
 
 def get_engine():

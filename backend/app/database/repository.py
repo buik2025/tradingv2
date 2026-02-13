@@ -436,11 +436,72 @@ class Repository:
             
             result = []
             for s in strategies:
-                # Get trades for this strategy
-                trades = session.query(StrategyTrade).filter(
-                    StrategyTrade.strategy_id == s.id,
-                    StrategyTrade.status == "OPEN"
-                ).all()
+                trades_data = []
+                
+                # For PAPER strategies, get positions from strategy_positions -> broker_positions
+                if s.source == "PAPER":
+                    positions = session.query(BrokerPosition).join(
+                        StrategyPosition, BrokerPosition.id == StrategyPosition.position_id
+                    ).filter(
+                        StrategyPosition.strategy_id == s.id,
+                        BrokerPosition.quantity != 0
+                    ).all()
+                    
+                    for p in positions:
+                        avg_price = float(p.average_price or 0)
+                        last_price = float(p.last_price) if p.last_price else avg_price
+                        qty = p.quantity
+                        
+                        # Calculate P&L
+                        if qty > 0:  # Long
+                            pnl = (last_price - avg_price) * qty
+                        else:  # Short
+                            pnl = (avg_price - last_price) * abs(qty)
+                        
+                        pnl_pct = ((last_price - avg_price) / avg_price * 100) if avg_price else 0
+                        
+                        # Use stored margin_used from database
+                        margin_used = float(p.margin_used) if p.margin_used else 0.0
+                        
+                        trades_data.append({
+                            "id": p.id,
+                            "tradingsymbol": p.tradingsymbol,
+                            "instrument_token": p.instrument_token,
+                            "exchange": p.exchange,
+                            "instrument_type": p.option_type or "FUT",
+                            "quantity": qty,
+                            "entry_price": round(avg_price, 2),
+                            "last_price": round(last_price, 2),
+                            "unrealized_pnl": round(pnl, 2),
+                            "realized_pnl": 0.0,
+                            "pnl_pct": round(pnl_pct, 2),
+                            "margin_used": round(margin_used, 2),
+                            "status": "OPEN",
+                            "entry_time": p.opened_at.isoformat() if p.opened_at else None,
+                        })
+                else:
+                    # For LIVE/MANUAL strategies, get from strategy_trades
+                    trades = session.query(StrategyTrade).filter(
+                        StrategyTrade.strategy_id == s.id,
+                        StrategyTrade.status == "OPEN"
+                    ).all()
+                    
+                    for t in trades:
+                        trades_data.append({
+                            "id": t.id,
+                            "tradingsymbol": t.tradingsymbol,
+                            "instrument_token": t.instrument_token,
+                            "exchange": t.exchange,
+                            "instrument_type": t.instrument_type,
+                            "quantity": t.quantity,
+                            "entry_price": round(float(t.entry_price or 0), 2),
+                            "last_price": round(float(t.last_price), 2) if t.last_price else 0.0,
+                            "unrealized_pnl": round(float(t.unrealized_pnl or 0), 2),
+                            "realized_pnl": round(float(t.realized_pnl or 0), 2),
+                            "pnl_pct": round(float(t.pnl_pct or 0), 2),
+                            "status": t.status,
+                            "entry_time": t.entry_time.isoformat() if t.entry_time else None,
+                        })
                 
                 result.append({
                     "id": s.id,
@@ -450,29 +511,12 @@ class Repository:
                     "label": s.label,
                     "status": s.status,
                     "source": s.source,
-                    "realized_pnl": float(s.realized_pnl or 0),
-                    "unrealized_pnl": float(s.unrealized_pnl or 0),
+                    "realized_pnl": round(float(s.realized_pnl or 0), 2),
+                    "unrealized_pnl": round(float(s.unrealized_pnl or 0), 2),
                     "notes": s.notes,
                     "tags": s.tags,
                     "created_at": s.created_at.isoformat() if s.created_at else None,
-                    "trades": [
-                        {
-                            "id": t.id,
-                            "tradingsymbol": t.tradingsymbol,
-                            "instrument_token": t.instrument_token,
-                            "exchange": t.exchange,
-                            "instrument_type": t.instrument_type,
-                            "quantity": t.quantity,
-                            "entry_price": float(t.entry_price or 0),
-                            "last_price": float(t.last_price) if t.last_price else None,
-                            "unrealized_pnl": float(t.unrealized_pnl or 0),
-                            "realized_pnl": float(t.realized_pnl or 0),
-                            "pnl_pct": float(t.pnl_pct or 0),
-                            "status": t.status,
-                            "entry_time": t.entry_time.isoformat() if t.entry_time else None,
-                        }
-                        for t in trades
-                    ]
+                    "trades": trades_data
                 })
             
             return result

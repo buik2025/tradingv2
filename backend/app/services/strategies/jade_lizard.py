@@ -29,9 +29,16 @@ class JadeLizardStrategy:
     - Bullish or neutral bias
     """
     
-    def __init__(self, lot_size: int = 50):
+    def __init__(self, lot_size: int = 50, kite=None):
         self.lot_size = lot_size
+        self.kite = kite
         self.name = "JADE_LIZARD"
+    
+    def _get_lot_size(self, symbol: str) -> int:
+        """Get lot size from Kite API or use default."""
+        if self.kite and hasattr(self.kite, 'get_lot_size'):
+            return self.kite.get_lot_size(symbol)
+        return self.lot_size
     
     def check_entry_conditions(self, regime: RegimePacket) -> Tuple[bool, str]:
         """
@@ -92,7 +99,7 @@ class JadeLizardStrategy:
         short_put, short_call, long_call = strikes
         
         # Build legs
-        legs = self._build_legs(option_chain, strikes, expiry)
+        legs = self._build_legs(option_chain, strikes, expiry, symbol=regime.symbol)
         if len(legs) != 3:
             return None
         
@@ -101,26 +108,35 @@ class JadeLizardStrategy:
         call_spread_credit = legs[1].entry_price - legs[2].entry_price  # Short call - long call
         net_credit = put_credit + call_spread_credit
         
+        # Get dynamic lot size
+        lot_size = self._get_lot_size(regime.symbol)
+        
         # Max loss calculation for Jade Lizard:
         # Downside: Unlimited below short put, but use 2x ATR move as practical max loss
         # For risk management, use distance from spot to short put as max adverse move
         downside_distance = regime.spot_price - short_put
-        practical_max_loss = (downside_distance * 2 - net_credit) * self.lot_size  # 2x the OTM distance
-        practical_max_loss = max(practical_max_loss, net_credit * self.lot_size * 2)  # At least 2x credit
+        practical_max_loss = (downside_distance * 2 - net_credit) * lot_size  # 2x the OTM distance
+        practical_max_loss = max(practical_max_loss, net_credit * lot_size * 2)  # At least 2x credit
         
         # Upside risk is capped by the call spread
         call_spread_width = long_call - short_call
-        upside_max_loss = (call_spread_width - call_spread_credit) * self.lot_size
+        upside_max_loss = (call_spread_width - call_spread_credit) * lot_size
         
         # Use the larger of the two as max loss
         max_loss = max(practical_max_loss, upside_max_loss)
         
-        max_profit = net_credit * self.lot_size
+        max_profit = net_credit * lot_size
         target_pnl = max_profit * 0.50  # 50% of max profit
         stop_loss = -max_loss * 0.50  # 50% of max loss
         
         greeks = self._calculate_greeks(legs)
-        required_margin = max(max_loss, net_credit * self.lot_size * 3)  # Margin based on risk
+        
+        # Get actual margin from Kite API
+        required_margin = self._calculate_margin_from_api(legs, lot_size)
+        if required_margin == 0:
+            # Fallback estimation if API fails
+            required_margin = max(max_loss, net_credit * lot_size * 3)
+            logger.warning(f"Using fallback margin estimate: ₹{required_margin:,.0f}")
         
         days_to_expiry = (expiry - date.today()).days
         
@@ -177,7 +193,8 @@ class JadeLizardStrategy:
         self,
         option_chain: pd.DataFrame,
         strikes: Tuple[float, float, float],
-        expiry: date
+        expiry: date,
+        symbol: str = "NIFTY"
     ) -> List[TradeLeg]:
         """Build the three legs of Jade Lizard."""
         short_put, short_call, long_call = strikes
@@ -208,7 +225,7 @@ class JadeLizardStrategy:
                 strike=strike,
                 expiry=expiry,
                 option_type=opt_type,
-                quantity=self.lot_size,
+                quantity=self._get_lot_size(symbol),
                 entry_price=float(opt.get('ltp', 0)),
                 delta=float(opt.get('delta', 0)),
                 gamma=float(opt.get('gamma', 0)),
@@ -228,3 +245,60 @@ class JadeLizardStrategy:
             greeks["theta"] += leg.theta * multiplier * leg.quantity
             greeks["vega"] += leg.vega * multiplier * leg.quantity
         return greeks
+    
+    def _calculate_margin_from_api(self, legs: List[TradeLeg], lot_size: int) -> float:
+        """
+        Calculate actual margin required using Kite order_margins API.
+        
+        Args:
+            legs: List of TradeLeg objects
+            lot_size: Lot size for the instrument
+            
+        Returns:
+            Total margin required (float), or 0 if API call fails
+        """
+        if not self.kite or not legs:
+            return 0.0
+        
+        # Build orders list for Kite API
+        orders = []
+        for leg in legs:
+            order = {
+                "exchange": leg.exchange or "NFO",
+                "tradingsymbol": leg.tradingsymbol,
+                "transaction_type": "SELL" if leg.is_short else "BUY",
+                "variety": "regular",
+                "product": "NRML",
+                "order_type": "MARKET",
+                "quantity": leg.quantity or lot_size,
+                "price": 0
+            }
+            orders.append(order)
+        
+        try:
+            # Use basket_margins for combined margin (accounts for hedging)
+            basket = {"orders": orders}
+            margin_result = self.kite.get_basket_margins(basket)
+            
+            if margin_result:
+                # Basket margins returns combined margin with hedging benefit
+                total_margin = margin_result.get("final", {}).get("total", 0)
+                if total_margin == 0:
+                    total_margin = margin_result.get("initial", {}).get("total", 0)
+                
+                if total_margin > 0:
+                    logger.info(f"Kite API margin for Jade Lizard: ₹{total_margin:,.0f}")
+                    return total_margin
+            
+            # Fallback: use order_margins for individual legs
+            margin_results = self.kite.get_order_margins(orders)
+            if margin_results:
+                total_margin = sum(m.get("total", 0) for m in margin_results)
+                if total_margin > 0:
+                    logger.info(f"Kite API margin (individual): ₹{total_margin:,.0f}")
+                    return total_margin
+                    
+        except Exception as e:
+            logger.warning(f"Failed to get margin from Kite API: {e}")
+        
+        return 0.0

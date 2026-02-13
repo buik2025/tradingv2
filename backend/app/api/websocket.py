@@ -269,11 +269,15 @@ class ConnectionManager:
         self._price_cache[instrument_token] = last_price
     
     def _get_all_positions(self) -> list:
-        """Get all open positions from database."""
+        """Get all open F&O positions from database."""
+        # F&O exchanges only - filter out equity
+        FO_EXCHANGES = {"NFO", "MCX", "BFO", "CDS"}
+        
         try:
             session = get_session()
             positions = session.query(BrokerPosition).filter(
-                BrokerPosition.closed_at.is_(None)
+                BrokerPosition.closed_at.is_(None),
+                BrokerPosition.exchange.in_(FO_EXCHANGES)
             ).all()
             
             result = []
@@ -632,16 +636,23 @@ def fetch_positions_once() -> list:
         positions_data = kite.get_positions()
         net_positions = positions_data.get("net", [])
         
+        # F&O exchanges only - filter out equity
+        FO_EXCHANGES = {"NFO", "MCX", "BFO", "CDS"}
+        
         result = []
         for p in net_positions:
             qty = p.get("quantity", 0)
             if qty == 0:
                 continue
             
+            # Filter to F&O only
+            exchange = p.get("exchange", "")
+            if exchange not in FO_EXCHANGES:
+                continue
+            
             instrument_token = p.get("instrument_token", 0)
             avg_price = p.get("average_price", 0)
             last_price = p.get("last_price", 0)
-            exchange = p.get("exchange", "NFO")
             
             # Use backend P&L calculator for accurate calculations
             pnl_data = PnLCalculator.calculate_position_pnl(
@@ -678,9 +689,114 @@ def fetch_positions_once() -> list:
                 "source": "LIVE"
             })
         
+        # Also fetch paper positions from database and add to result
+        paper_positions = fetch_paper_positions_from_db(kite, cache)
+        result.extend(paper_positions)
+        
         return result
     except Exception as e:
         logger.error(f"Failed to fetch positions: {e}")
+        return []
+
+
+def fetch_paper_positions_from_db(kite: KiteClient, cache: InstrumentCache) -> list:
+    """Fetch paper positions from database for WebSocket subscription.
+    
+    Args:
+        kite: KiteClient instance for LTP lookup
+        cache: InstrumentCache for instrument info
+        
+    Returns:
+        List of paper position dicts with live prices
+    """
+    try:
+        session = get_session()
+        
+        # Get all paper positions with non-zero quantity
+        paper_positions = session.query(BrokerPosition).filter(
+            BrokerPosition.source == "PAPER",
+            BrokerPosition.quantity != 0
+        ).all()
+        
+        if not paper_positions:
+            session.close()
+            return []
+        
+        # Get LTP for all paper position tokens
+        tokens = [p.instrument_token for p in paper_positions if p.instrument_token]
+        ltp_data = {}
+        if tokens:
+            ltp_data = kite.get_ltp(tokens)
+        
+        # Get full quotes for close price data
+        quote_data = {}
+        if tokens:
+            quote_data = kite.get_quote(tokens)
+        
+        result = []
+        for p in paper_positions:
+            qty = p.quantity
+            avg_price = float(p.average_price) if p.average_price else 0
+            
+            # Get quote data for this token
+            token_quote = quote_data.get(p.instrument_token, {})
+            last_price = token_quote.get("last_price", 0) or ltp_data.get(p.instrument_token, avg_price)
+            if last_price == 0:
+                last_price = avg_price
+            
+            # Get close price from OHLC data for day change calculation
+            ohlc = token_quote.get("ohlc", {})
+            close_price = ohlc.get("close", 0)
+            
+            # Calculate LTP change from previous close (for day change display)
+            # If no close price available, use avg_price as reference
+            if close_price and close_price > 0:
+                ltp_change = last_price - close_price
+                ltp_change_pct = (ltp_change / close_price * 100)
+            else:
+                # Fallback: show change from avg price
+                ltp_change = last_price - avg_price
+                ltp_change_pct = ((last_price - avg_price) / avg_price * 100) if avg_price else 0
+            
+            # Calculate P&L
+            if qty > 0:  # Long position
+                pnl = (last_price - avg_price) * qty
+            else:  # Short position
+                pnl = (avg_price - last_price) * abs(qty)
+            
+            pnl_pct = (pnl / (avg_price * abs(qty)) * 100) if avg_price and qty else 0
+            
+            # Get instrument info
+            inst_info = cache.get(p.instrument_token) or {}
+            
+            # Use stored margin_used from database
+            margin_used = float(p.margin_used) if p.margin_used else 0.0
+            
+            result.append({
+                "id": p.id,
+                "tradingsymbol": p.tradingsymbol,
+                "instrument_token": p.instrument_token,
+                "exchange": p.exchange or "NFO",
+                "quantity": qty,
+                "average_price": round(avg_price, 2),
+                "last_price": round(last_price, 2),
+                "close_price": round(close_price, 2) if close_price else round(avg_price, 2),
+                "ltp_change": round(ltp_change, 2),
+                "ltp_change_pct": round(ltp_change_pct, 2),
+                "pnl": round(pnl, 2),
+                "pnl_pct": round(pnl_pct, 2),
+                "margin_used": round(margin_used, 2),
+                "lot_size": inst_info.get("lot_size", 1),
+                "instrument_type": p.option_type or "FUT",
+                "source": "PAPER"
+            })
+        
+        session.close()
+        logger.info(f"Loaded {len(result)} paper positions for WebSocket subscription")
+        return result
+        
+    except Exception as e:
+        logger.error(f"Failed to fetch paper positions: {e}")
         return []
 
 
@@ -700,9 +816,11 @@ def fetch_strategies_and_portfolios(positions: list) -> tuple:
         
         # Create position lookup by instrument_token
         pos_lookup = {p.get("instrument_token"): p for p in positions}
+        logger.debug(f"Position lookup tokens: {list(pos_lookup.keys())}")
         
         # Get strategies from database
         strategies_data = repo.get_all_strategies()
+        logger.debug(f"Fetched {len(strategies_data)} strategies from DB")
         
         # Enrich strategies with live position data
         enriched_strategies = []
@@ -720,26 +838,53 @@ def fetch_strategies_and_portfolios(positions: list) -> tuple:
                     trade_pnl = live_pos.get("pnl", 0)
                     enriched_trades.append({
                         **trade,
-                        "last_price": live_pos.get("last_price"),
-                        "unrealized_pnl": trade_pnl,
-                        "pnl_pct": live_pos.get("pnl_pct", 0)
+                        "last_price": round(live_pos.get("last_price", 0), 2),
+                        "unrealized_pnl": round(trade_pnl, 2),
+                        "pnl_pct": round(live_pos.get("pnl_pct", 0), 2),
+                        "margin_used": round(live_pos.get("margin_used", 0), 2)
                     })
                     total_pnl += trade_pnl
                 else:
-                    enriched_trades.append(trade)
-                    total_pnl += trade.get("unrealized_pnl", 0)
+                    # No live position found - calculate P&L from trade data
+                    entry_price = trade.get("entry_price", 0)
+                    last_price = trade.get("last_price") or entry_price
+                    qty = trade.get("quantity", 0)
+                    
+                    # Calculate P&L based on position direction
+                    if qty > 0:  # Long
+                        trade_pnl = (last_price - entry_price) * qty
+                    else:  # Short
+                        trade_pnl = (entry_price - last_price) * abs(qty)
+                    
+                    pnl_pct = ((last_price - entry_price) / entry_price * 100) if entry_price else 0
+                    
+                    enriched_trades.append({
+                        **trade,
+                        "last_price": round(last_price, 2),
+                        "unrealized_pnl": round(trade_pnl, 2),
+                        "pnl_pct": round(pnl_pct, 2),
+                        "margin_used": 0.0
+                    })
+                    total_pnl += trade_pnl
+            
+            # Calculate total margin from trades
+            total_margin = sum(t.get("margin_used", 0) for t in enriched_trades)
+            pnl_on_margin_pct = (total_pnl / total_margin * 100) if total_margin > 0 else 0
             
             enriched_strategies.append({
                 "id": strategy.get("id"),
                 "name": strategy.get("name"),
                 "label": strategy.get("label"),
                 "status": strategy.get("status"),
-                "unrealized_pnl": round(total_pnl, 2),
-                "realized_pnl": strategy.get("realized_pnl", 0),
-                "total_pnl": round(total_pnl + strategy.get("realized_pnl", 0), 2),
-                "position_count": len(trades),
                 "source": strategy.get("source", "MANUAL"),
-                "trades": enriched_trades
+                "trades_count": len(trades),
+                "trades": enriched_trades,
+                "unrealized_pnl": round(total_pnl, 2),
+                "realized_pnl": round(strategy.get("realized_pnl", 0), 2),
+                "total_pnl": round(total_pnl + strategy.get("realized_pnl", 0), 2),
+                "total_margin": round(total_margin, 2),
+                "margin_pct": 0.0,
+                "pnl_on_margin_pct": round(pnl_on_margin_pct, 2)
             })
         
         # Get portfolios from database

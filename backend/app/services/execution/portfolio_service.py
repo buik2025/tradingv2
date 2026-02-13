@@ -192,7 +192,14 @@ class PortfolioService:
         return self._account
     
     def get_positions(self) -> List[EnrichedPosition]:
-        """Get all positions with margin and P&L calculations."""
+        """Get all F&O positions with margin and P&L calculations.
+        
+        Filters to F&O exchanges only (NFO, MCX, BFO, CDS).
+        Equity positions (NSE, BSE) are excluded.
+        """
+        # F&O exchanges only
+        FO_EXCHANGES = {"NFO", "MCX", "BFO", "CDS"}
+        
         # Ensure we have account data
         if not self._account:
             self.get_account_summary()
@@ -201,6 +208,9 @@ class PortfolioService:
         
         positions_data = self.kite.get_positions()
         net_positions = positions_data.get("net", [])
+        
+        # Filter to F&O only
+        net_positions = [p for p in net_positions if p.get("exchange", "") in FO_EXCHANGES]
         
         # Get margin for each position
         margin_lookup = self._calculate_position_margins(net_positions)
@@ -417,8 +427,8 @@ class PortfolioService:
                 exchange=trade.get("exchange", ""),
                 instrument_type=trade.get("instrument_type"),
                 quantity=trade.get("quantity", 0),
-                entry_price=trade.get("entry_price", 0),
-                last_price=last_price,
+                entry_price=round(trade.get("entry_price", 0), 2),
+                last_price=round(last_price, 2) if last_price else 0.0,
                 unrealized_pnl=round(unrealized_pnl, 2),
                 realized_pnl=round(trade.get("realized_pnl", 0), 2),
                 pnl_pct=round(trade.get("pnl_pct", 0), 2),
@@ -465,6 +475,45 @@ class PortfolioService:
             logger.warning(f"Failed to get order margins: {e}")
         
         return margin_lookup
+    
+    def _get_position_margin_from_api(self, tradingsymbol: str, exchange: str, qty: int, product: str) -> float:
+        """
+        Get actual margin for a position using Kite order_margins API.
+        
+        Args:
+            tradingsymbol: Trading symbol
+            exchange: Exchange (NFO, MCX, etc.)
+            qty: Position quantity (negative for short)
+            product: Product type (NRML, MIS, etc.)
+            
+        Returns:
+            Margin amount or 0 if API call fails
+        """
+        if qty == 0:
+            return 0.0
+        
+        try:
+            order = {
+                "exchange": exchange,
+                "tradingsymbol": tradingsymbol,
+                "transaction_type": "SELL" if qty < 0 else "BUY",
+                "variety": "regular",
+                "product": product,
+                "order_type": "MARKET",
+                "quantity": abs(qty),
+                "price": 0
+            }
+            
+            margin_results = self.kite.get_order_margins([order])
+            if margin_results and len(margin_results) > 0:
+                total_margin = margin_results[0].get("total", 0)
+                if total_margin > 0:
+                    return total_margin
+                    
+        except Exception as e:
+            logger.debug(f"Failed to get margin from API for {tradingsymbol}: {e}")
+        
+        return 0.0
     
     def _estimate_margin(self, symbol: str, exchange: str, qty: int, ltp: float, avg_price: float, product: str) -> float:
         """Fallback margin estimation when API fails."""
@@ -577,8 +626,10 @@ class PortfolioService:
                     avg_price = float(p.average_price) if p.average_price else 0
                     
                     # Get LTP from API or use average price
-                    ltp_key = f"{p.exchange}:{p.tradingsymbol}"
-                    last_price = ltp_data.get(ltp_key, {}).get("last_price", avg_price)
+                    # get_ltp returns {token: price} so use token as key
+                    last_price = ltp_data.get(p.instrument_token, avg_price)
+                    if last_price == 0:
+                        last_price = avg_price
                     
                     # Calculate P&L
                     if qty > 0:  # Long position
@@ -586,10 +637,19 @@ class PortfolioService:
                     else:  # Short position
                         pnl = (avg_price - last_price) * abs(qty)
                     
-                    # Estimate margin for DB positions
-                    position_margin = self._estimate_margin(
-                        p.tradingsymbol, p.exchange, qty, last_price, avg_price, p.product or "NRML"
+                    # Calculate LTP change from avg price (for paper positions)
+                    ltp_change = last_price - avg_price
+                    ltp_change_pct = ((last_price - avg_price) / avg_price * 100) if avg_price else 0
+                    
+                    # Get margin from Kite API for accurate calculation
+                    position_margin = self._get_position_margin_from_api(
+                        p.tradingsymbol, p.exchange, qty, p.product or "NRML"
                     )
+                    if position_margin == 0:
+                        # Fallback to estimation if API fails
+                        position_margin = self._estimate_margin(
+                            p.tradingsymbol, p.exchange, qty, last_price, avg_price, p.product or "NRML"
+                        )
                     
                     # Calculate percentages
                     pnl_pct = (pnl / (avg_price * abs(qty)) * 100) if avg_price and qty else 0
@@ -611,9 +671,9 @@ class PortfolioService:
                         quantity=qty,
                         average_price=round(avg_price, 2),
                         last_price=round(last_price, 2),
-                        close_price=0.0,
-                        ltp_change=0.0,
-                        ltp_change_pct=0.0,
+                        close_price=round(avg_price, 2),
+                        ltp_change=round(ltp_change, 2),
+                        ltp_change_pct=round(ltp_change_pct, 2),
                         pnl=round(pnl, 2),
                         pnl_pct=round(pnl_pct, 2),
                         product=p.product or "NRML",

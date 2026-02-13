@@ -9,6 +9,7 @@ from ..agents import BaseAgent
 from ...core.kite_client import KiteClient
 from ...core.state_manager import StateManager
 from ...config.settings import Settings
+from .greek_hedger import GreekHedger, GreekHedgeRecommendation, HedgeType
 from ...config.constants import (
     NFO, BUY, SELL, ORDER_TYPE_LIMIT, ORDER_TYPE_MARKET,
     PRODUCT_NRML, PRODUCT_MIS,
@@ -38,19 +39,35 @@ class Executor(BaseAgent):
     - Emergency flatten functionality
     """
     
-    def __init__(self, kite: KiteClient, config: Settings, state_manager: Optional[StateManager] = None):
+    def __init__(
+        self,
+        kite: KiteClient,
+        config: Settings,
+        state_manager: Optional[StateManager] = None,
+        greek_hedger: Optional[GreekHedger] = None,
+        treasury: Optional[object] = None  # Avoid circular import
+    ):
         super().__init__(kite, config, name="Executor")
         self._pending_orders: Dict[str, OrderTicket] = {}
         self._positions: Dict[str, Position] = {}
         self.repository = Repository()
         self.state_manager = state_manager or StateManager()
         
+        # Greek hedger for portfolio risk management
+        self.greek_hedger = greek_hedger or GreekHedger(equity=10_000_000)
+        
+        # Treasury reference for recording trade results
+        self._treasury = treasury
+        
         # Slippage tracking (Section 8)
         self._slippage_alerts: List[Dict] = []
         
-        # Load paper positions if in paper mode
-        if self.kite.paper_mode:
-            self._load_positions()
+        # Track existing structures to prevent duplicates
+        self._existing_structures: set = set()
+        
+        # Always load existing paper positions from DB to prevent duplicates
+        # This is needed regardless of paper_mode since we track all paper strategies
+        self._load_positions()
     
     def process(self, signal: TradeSignal) -> ExecutionResult:
         """
@@ -93,12 +110,24 @@ class Executor(BaseAgent):
             self._wait_for_fills(orders)
             position = self._create_position(signal, orders)
             if position:
+                # Guard: Don't persist positions with zero entry price (API quotes unavailable)
+                if position.entry_price == 0:
+                    self.logger.warning(f"Skipping position with zero entry price - API quotes unavailable")
+                    return ExecutionResult(
+                        signal_id=signal.id,
+                        success=False,
+                        orders=orders,
+                        error="Zero entry price - API quotes unavailable"
+                    )
                 self._positions[position.id] = position
                 # Persist position to database (both paper and live)
                 self._persist_position(position)
                 if self.kite.paper_mode:
                     # Update paper margin tracking
                     self._update_paper_margin(signal.approved_margin, add=True)
+                    # Track this structure as having an open position
+                    if hasattr(self, '_existing_structures'):
+                        self._existing_structures.add(position.strategy_type.value)
         else:
             # Rollback successful orders if partial failure
             self._rollback_orders([o for o in orders if o.status == OrderStatus.OPEN])
@@ -267,20 +296,32 @@ class Executor(BaseAgent):
     def monitor_positions(
         self,
         current_prices: Dict[int, float],
-        current_regime: Optional[RegimeType] = None
+        current_regime: Optional[RegimeType] = None,
+        check_greeks: bool = True
     ) -> List[ExitOrder]:
         """
         Monitor positions and generate exit orders.
         
+        Includes Greek hedging checks per Section 5/6 of rulebook:
+        - Delta breach (±12%) triggers hedge recommendation
+        - Vega breach (±35%) triggers hedge recommendation
+        - Gamma breach (-0.15%) triggers risk reduction
+        
         Args:
             current_prices: Dict of token -> current price
             current_regime: Current market regime
+            check_greeks: Whether to check portfolio Greeks
             
         Returns:
             List of exit orders to execute
         """
         exit_orders = []
         now = datetime.now()
+        
+        # Update portfolio Greeks and check for hedging needs
+        if check_greeks:
+            self._update_portfolio_greeks()
+            hedge_recommendations = self._check_greek_hedging()
         
         for pos_id, position in self._positions.items():
             if position.status != PositionStatus.OPEN:
@@ -414,7 +455,7 @@ class Executor(BaseAgent):
         position.close(exit_value, exit_order.exit_reason)
         
         if self.kite.paper_mode:
-            self._persist_paper_position(position)
+            self._persist_position(position)  # Update position status in DB
             # Release margin when position is closed
             self._update_paper_margin(position.entry_margin, add=False)
         
@@ -435,6 +476,10 @@ class Executor(BaseAgent):
         streak_info = self.state_manager.record_trade_result(realized_pnl, position.id)
         if streak_info.get("actions"):
             self.logger.info(f"Trade result recorded: {streak_info}")
+        
+        # Record to Treasury's circuit breaker for loss limit tracking
+        is_win = realized_pnl > 0
+        self._record_trade_to_treasury(pnl=realized_pnl, is_win=is_win)
         
         self.logger.info(f"Exit completed: P&L={realized_pnl:.2f}")
         
@@ -473,6 +518,81 @@ class Executor(BaseAgent):
         broker_positions = self.kite.get_positions()
         # Implementation would reconcile local positions with broker
         pass
+    
+    def _update_portfolio_greeks(self) -> None:
+        """
+        Update GreekHedger with current portfolio Greeks from open positions.
+        
+        Aggregates delta, vega, gamma, theta across all open positions.
+        """
+        total_delta = 0.0
+        total_vega = 0.0
+        total_gamma = 0.0
+        total_theta = 0.0
+        
+        for position in self._positions.values():
+            if position.status != PositionStatus.OPEN:
+                continue
+            
+            # Get Greeks from position legs
+            for leg in position.legs:
+                delta = getattr(leg, 'delta', 0) or 0
+                vega = getattr(leg, 'vega', 0) or 0
+                gamma = getattr(leg, 'gamma', 0) or 0
+                theta = getattr(leg, 'theta', 0) or 0
+                
+                # Adjust for quantity (negative for short positions)
+                qty_mult = leg.quantity if leg.is_long else -leg.quantity
+                total_delta += delta * qty_mult
+                total_vega += vega * qty_mult
+                total_gamma += gamma * qty_mult
+                total_theta += theta * qty_mult
+        
+        # Update the hedger
+        self.greek_hedger.update_portfolio_greeks(
+            delta=total_delta,
+            vega=total_vega,
+            gamma=total_gamma,
+            theta=total_theta
+        )
+    
+    def _check_greek_hedging(self) -> List[GreekHedgeRecommendation]:
+        """
+        Check if portfolio Greeks require hedging.
+        
+        Returns:
+            List of hedge recommendations if Greeks are breached
+        """
+        recommendations = []
+        
+        if self.greek_hedger.should_rebalance():
+            recommendations = self.greek_hedger.get_hedging_recommendations()
+            
+            for rec in recommendations:
+                self.logger.warning(
+                    f"GREEK HEDGE NEEDED: {rec.hedge_type.value} - {rec.reason} "
+                    f"(current: {rec.current_value:.2%}, threshold: {rec.threshold:.2%})"
+                )
+        
+        # Check short Greek caps (Section 5)
+        cap_breaches = self.greek_hedger.check_short_greek_caps()
+        if cap_breaches.get("vega_cap_breached") or cap_breaches.get("gamma_cap_breached"):
+            self.logger.warning(f"SHORT GREEK CAP BREACHED: {cap_breaches}")
+        
+        return recommendations
+    
+    def get_greek_status(self) -> Dict:
+        """Get current portfolio Greek status from hedger."""
+        return self.greek_hedger.get_status()
+    
+    def set_treasury(self, treasury: object) -> None:
+        """Set treasury reference for trade result recording."""
+        self._treasury = treasury
+    
+    def _record_trade_to_treasury(self, pnl: float, is_win: bool) -> None:
+        """Record trade result to Treasury's circuit breaker."""
+        if self._treasury and hasattr(self._treasury, 'record_trade_result'):
+            self._treasury.record_trade_result(pnl=pnl, is_win=is_win)
 
     def _persist_position(self, position: Position) -> None:
         """
@@ -491,6 +611,17 @@ class Executor(BaseAgent):
         
         try:
             with self.repository._get_session() as session:
+                # CRITICAL: Check for existing strategy with same label BEFORE creating
+                existing_strategy = session.query(Strategy).filter(
+                    Strategy.source == source,
+                    Strategy.status == "OPEN",
+                    Strategy.label == position.strategy_type.value
+                ).first()
+                
+                if existing_strategy:
+                    self.logger.warning(f"Strategy {position.strategy_type.value} already exists (id={existing_strategy.id}), skipping creation")
+                    return
+                
                 # 1. Get or create default Portfolio for this mode
                 portfolio = session.query(Portfolio).filter_by(
                     name=portfolio_name
@@ -508,23 +639,27 @@ class Executor(BaseAgent):
                     self.logger.info(f"Created {portfolio_name} portfolio: {portfolio.id}")
                 
                 # 2. Create Strategy record
-                strategy_name = f"{position.structure.value} - {position.instrument}"
+                strategy_name = f"{position.strategy_type.value} - {position.instrument}"
                 strategy = Strategy(
                     id=str(uuid.uuid4()),
                     portfolio_id=portfolio.id,
                     name=strategy_name,
-                    label=position.structure.value,
+                    label=position.strategy_type.value,
                     primary_instrument=position.instrument,
                     status="OPEN",
                     source=source,
                     notes=f"Auto-created from {source.lower()} trade execution at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-                    tags=[source.lower(), "auto-generated", position.structure.value.lower()]
+                    tags=[source.lower(), "auto-generated", position.strategy_type.value.lower()]
                 )
                 session.add(strategy)
                 session.flush()
                 self.logger.info(f"Created strategy: {strategy.id} - {strategy_name} ({source})")
                 
                 # 3. Create BrokerPosition records and link to Strategy
+                # Calculate margin per leg (distribute position margin evenly)
+                num_legs = len(position.legs)
+                margin_per_leg = position.entry_margin / num_legs if num_legs > 0 else 0
+                
                 broker_position_ids = []
                 for leg in position.legs:
                     qty = leg.quantity if leg.is_long else -leg.quantity
@@ -548,7 +683,8 @@ class Executor(BaseAgent):
                         product="NRML",
                         transaction_type="BUY" if qty > 0 else "SELL",
                         source=source,
-                        broker_order_id=leg.broker_order_id if hasattr(leg, 'broker_order_id') else f"{source}_ORD_{leg.instrument_token}"
+                        broker_order_id=leg.broker_order_id if hasattr(leg, 'broker_order_id') else f"{source}_ORD_{leg.instrument_token}",
+                        margin_used=margin_per_leg
                     )
                     session.add(bp)
                     broker_position_ids.append(bp_id)
@@ -567,16 +703,61 @@ class Executor(BaseAgent):
                 session.commit()
                 self.logger.info(f"Persisted {source} position {position.id} with strategy {strategy.id}")
                 
+                # Update existing structures tracking
+                self._existing_structures.add(position.strategy_type.value)
+                
         except Exception as e:
             self.logger.error(f"Failed to persist {source} position: {e}")
 
     def _load_positions(self) -> None:
-        """Load paper positions from DB (Best effort)."""
-        # Retrieving positions for UI visibility is handled by PortfolioService.
-        # Rehydrating Executor state is complex without strategy metadata.
-        # For now, we rely on in-memory state for active management during the session.
-        pass
-    
+        """Load existing paper positions from database to track open structures."""
+        try:
+            from ..database.models import Strategy, get_session
+            
+            session = get_session()
+            
+            # Get all OPEN paper strategies
+            open_strategies = session.query(Strategy).filter(
+                Strategy.source == "PAPER",
+                Strategy.status == "OPEN"
+            ).all()
+            
+            # Track existing structures to prevent duplicates
+            self._existing_structures = set()
+            for strategy in open_strategies:
+                if strategy.label:
+                    self._existing_structures.add(strategy.label)
+                    self.logger.info(f"Tracking existing structure: {strategy.label} (strategy_id={strategy.id})")
+            
+            self.logger.info(f"Loaded {len(open_strategies)} open paper strategies, structures: {self._existing_structures}")
+            
+            session.close()
+            
+        except Exception as e:
+            self.logger.error(f"Failed to load paper positions: {e}")
+            import traceback
+            self.logger.error(traceback.format_exc())
+            self._existing_structures = set()
+
+    def has_open_position_for_structure(self, structure_value: str) -> bool:
+        """Check if there's already an open position for this structure type."""
+        # Always refresh from DB FIRST to ensure we have latest state
+        self._load_positions()
+        
+        # Check loaded structures from DB (highest priority)
+        if hasattr(self, '_existing_structures') and structure_value in self._existing_structures:
+            self.logger.info(f"Found existing structure {structure_value} in DB")
+            return True
+        
+        # Check in-memory positions as fallback
+        for pos in self._positions.values():
+            if pos.strategy_type.value == structure_value:
+                self.logger.info(f"Found existing structure {structure_value} in memory")
+                return True
+        
+        self.logger.debug(f"No existing position for structure {structure_value}")
+        return False
+
     def _update_paper_margin(self, margin_amount: float, add: bool = True) -> None:
         """
         Update paper trading margin tracking.

@@ -37,9 +37,16 @@ class IronCondorStrategy:
     - Time: T-5 days mandatory
     """
     
-    def __init__(self, lot_size: int = 50):
+    def __init__(self, lot_size: int = 50, kite=None):
         self.lot_size = lot_size
+        self.kite = kite
         self.name = "IRON_CONDOR"
+    
+    def _get_lot_size(self, symbol: str) -> int:
+        """Get lot size from Kite API or use default."""
+        if self.kite and hasattr(self.kite, 'get_lot_size'):
+            return self.kite.get_lot_size(symbol)
+        return self.lot_size
     
     def check_entry_conditions(self, regime: RegimePacket) -> Tuple[bool, str]:
         """
@@ -135,7 +142,8 @@ class IronCondorStrategy:
             short_put - long_put
         )
         
-        max_loss = wing_width * self.lot_size - net_credit
+        lot_size = self._get_lot_size(regime.symbol)
+        max_loss = wing_width * lot_size - net_credit
         max_profit = net_credit
         target_pnl = max_profit * IC_PROFIT_TARGET
         stop_loss = -net_credit * IC_STOP_LOSS
@@ -144,7 +152,7 @@ class IronCondorStrategy:
         greeks = self._calculate_greeks(legs)
         
         # Estimate margin
-        required_margin = wing_width * self.lot_size * 1.5  # Conservative estimate
+        required_margin = wing_width * lot_size * 1.5  # Conservative estimate
         
         days_to_expiry = (expiry - date.today()).days
         
@@ -214,7 +222,8 @@ class IronCondorStrategy:
         self,
         option_chain: pd.DataFrame,
         strikes: Tuple[float, float, float, float],
-        expiry: date
+        expiry: date,
+        symbol: str = "NIFTY"
     ) -> List[TradeLeg]:
         """Build the four legs of the Iron Condor."""
         short_call, short_put, long_call, long_put = strikes
@@ -228,7 +237,7 @@ class IronCondorStrategy:
         ]
         
         for strike, opt_type, leg_type in leg_configs:
-            leg = self._build_single_leg(option_chain, strike, opt_type, expiry, leg_type)
+            leg = self._build_single_leg(option_chain, strike, opt_type, expiry, leg_type, symbol)
             if leg:
                 legs.append(leg)
         
@@ -240,7 +249,8 @@ class IronCondorStrategy:
         strike: float,
         option_type: str,
         expiry: date,
-        leg_type: LegType
+        leg_type: LegType,
+        symbol: str = "NIFTY"
     ) -> Optional[TradeLeg]:
         """Build a single leg."""
         mask = (
@@ -262,7 +272,7 @@ class IronCondorStrategy:
             strike=strike,
             expiry=expiry,
             option_type=option_type,
-            quantity=self.lot_size,
+            quantity=self._get_lot_size(symbol),
             entry_price=float(opt.get('ltp', 0)),
             delta=float(opt.get('delta', 0.25 if option_type == 'CE' else -0.25)),
             gamma=float(opt.get('gamma', 0.01)),

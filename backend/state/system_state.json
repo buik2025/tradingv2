@@ -1,5 +1,5 @@
 {
-  "last_updated": "2026-02-10T15:23:32.303394",
+  "last_updated": "2026-02-13T14:42:43.622817",
   "high_watermark": 0.0,
   "daily_pnl": 0.0,
   "weekly_pnl": 0.0,
@@ -9,6 +9,36 @@
   "open_position_ids": [],
   "circuit_breaker_active": false,
   "circuit_breaker_reason": null,
-  "trading_day_start": "2026-02-10",
-  "paper_used_margin": 696239.9999999988
+  "trading_day_start": "2026-02-13",
+  "paper_used_margin": 3369055.347222215,
+  "total_slippage_today": 0.06513126501293832,
+  "slippage_alerts": [
+    {
+      "timestamp": "2026-02-13T14:05:22.269867",
+      "tradingsymbol": "NIFTY26FEB24900PE",
+      "order_id": "PAPER_20260213140522070781_NIFTY26FEB24900PE",
+      "expected_price": 35.7,
+      "actual_price": 35.4,
+      "slippage_pct": 0.008403361344537934,
+      "alert_level": "WARNING"
+    },
+    {
+      "timestamp": "2026-02-13T14:29:35.075693",
+      "tradingsymbol": "NIFTY26FEB24900PE",
+      "order_id": "PAPER_20260213142934900051_NIFTY26FEB24900PE",
+      "expected_price": 34.4,
+      "actual_price": 34.6,
+      "slippage_pct": 0.005813953488372176,
+      "alert_level": "WARNING"
+    },
+    {
+      "timestamp": "2026-02-13T14:29:35.076103",
+      "tradingsymbol": "NIFTY26FEB26300CE",
+      "order_id": "PAPER_20260213142935044740_NIFTY26FEB26300CE",
+      "expected_price": 22.25,
+      "actual_price": 22,
+      "slippage_pct": 0.011235955056179775,
+      "alert_level": "CRITICAL"
+    }
+  ]
 }

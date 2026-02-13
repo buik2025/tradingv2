@@ -64,13 +64,16 @@ class Position(BaseModel):
     exit_target_high: float = Field(..., description="Upper bound profit target")
     current_target: float = Field(..., description="Current active profit target")
     
-    # Trailing Profit (Section 11 - rulebook)
+    # Trailing Profit (Section 11 - rulebook, v2.5 updates)
     trailing_enabled: bool = Field(True, description="Enable trailing logic")
     trailing_mode: str = Field("none", description="'atr' or 'bbw' or 'none'")
     trailing_active: bool = Field(False, description="Trailing currently active")
     trailing_threshold: float = Field(0.5, description="Activate trailing at 50% profit")
     trailing_stop: Optional[float] = Field(None, description="Current trailing stop")
     trailing_last_update: Optional[datetime] = Field(None, description="Last update time")
+    # v2.5: Post-adjustment tightening
+    adjustment_count: int = Field(0, description="Number of adjustments made")
+    post_adjustment_tighten: float = Field(0.75, description="v2.5: 75% tighten after adjustment")
     
     # Flags
     is_intraday: bool = Field(False)
@@ -116,10 +119,16 @@ class Position(BaseModel):
     
     def should_exit_profit(self) -> bool:
         """Check if profit target hit."""
+        # Guard against zero prices (API quotes unavailable)
+        if self.entry_price == 0 or self.current_target == 0:
+            return False
         return self.current_pnl >= self.current_target
     
     def should_exit_stop(self) -> bool:
         """Check if stop loss hit."""
+        # Guard against zero prices (API quotes unavailable)
+        if self.entry_price == 0 or self.stop_loss == 0:
+            return False
         return self.current_pnl <= self.stop_loss
     
     def update_trailing_stop(self, current_price: float, atr: Optional[float] = None,
@@ -155,13 +164,27 @@ class Position(BaseModel):
             return self.current_pnl <= self.trailing_stop
         
         elif self.trailing_mode == "bbw" and bbw_ratio is not None:
-            # BBW-based: expand at >1.8x avg
+            # v2.5: BBW-based exit for short-vol
+            # If BBW > 1.5x avg and profitable, lock 60% of gains
+            # If BBW > 1.8x avg, exit immediately if profitable
             if bbw_ratio > 1.8 and self.current_pnl > 0:
-                lock_amount = self.current_target * 0.6
+                # v2.5: Immediate exit on extreme BBW expansion
+                return True
+            elif bbw_ratio > 1.5 and self.current_pnl > 0:
+                # Lock 60% of current profit
+                lock_amount = self.current_pnl * 0.6
                 if self.trailing_stop is None or lock_amount > self.trailing_stop:
                     self.trailing_stop = lock_amount
                     self.trailing_last_update = datetime.now()
-                return False
+                # Check if we've fallen below locked amount
+                if self.current_pnl < self.trailing_stop:
+                    return True
+        
+        # v2.5: Post-adjustment tightening (75% of original stop distance)
+        if self.adjustment_count > 0 and self.trailing_stop is not None:
+            tightened_stop = self.trailing_stop * self.post_adjustment_tighten
+            if self.current_pnl < tightened_stop:
+                return True
         
         return False
     

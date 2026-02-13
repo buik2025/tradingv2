@@ -8,7 +8,8 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { formatCurrency, formatPercent } from '@/lib/utils';
-import { ChevronDown, ChevronRight, RefreshCw, Wifi, WifiOff, Plus, FolderOpen, ExternalLink } from 'lucide-react';
+import { ChevronDown, ChevronRight, RefreshCw, Plus, FolderOpen, ExternalLink } from 'lucide-react';
+import { ConnectionBadge } from '@/components/ui/connection-badge';
 import { portfoliosApi } from '@/services/api';
 import { portfolioApi, type PortfoliosResponse } from '@/services/portfolioApi';
 import { useWebSocket } from '@/hooks/useWebSocket';
@@ -134,15 +135,7 @@ export function PortfoliosPage() {
           <p className="text-[var(--muted-foreground)]">Organize strategies into portfolios with margin tracking</p>
         </div>
         <div className="flex items-center gap-2">
-          {connected ? (
-            <Badge variant="outline" className="text-[var(--profit)] border-[var(--profit)]">
-              <Wifi className="h-3 w-3 mr-1" /> Live
-            </Badge>
-          ) : (
-            <Badge variant="outline" className="text-[var(--muted-foreground)]">
-              <WifiOff className="h-3 w-3 mr-1" /> Offline
-            </Badge>
-          )}
+          <ConnectionBadge connected={connected} />
           <Button size="sm" onClick={() => setShowCreatePortfolio(true)}>
             <Plus className="h-4 w-4 mr-1" /> New Portfolio
           </Button>

@@ -1,0 +1,20 @@
+{
+  "start_date": "2024-01-01",
+  "end_date": "2024-06-30",
+  "initial_capital": 500000.0,
+  "final_capital": 500000.0,
+  "total_return_pct": 0.0,
+  "total_trades": 0,
+  "winning_trades": 0,
+  "losing_trades": 0,
+  "win_rate": 0.0,
+  "max_drawdown_pct": 0,
+  "sharpe_ratio": 0,
+  "regime_distribution": {
+    "CAUTION": 32,
+    "MEAN_REVERSION": 22,
+    "TREND": 16,
+    "CHAOS": 4,
+    "RANGE_BOUND": 2
+  }
+}

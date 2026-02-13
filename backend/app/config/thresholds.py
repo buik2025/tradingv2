@@ -4,6 +4,7 @@
 ADX_RANGE_BOUND = 12       # ADX < 12 = Range-bound (lowered from 14 for safety)
 ADX_MEAN_REVERSION_MAX = 25    # ADX 12-25 = Mean-reversion
 ADX_TREND_MIN = 25             # ADX > 25 = Trend
+ADX_CHAOS_LEVEL = 60
 
 RSI_NEUTRAL_MIN = 35       # RSI 35-65 = Neutral (widened from 40-60)
 RSI_NEUTRAL_MAX = 65
@@ -49,12 +50,12 @@ ML_OVERRIDE_PROBABILITY = 0.7    # ML overrides rules if prob > 70%
 ML_CHAOS_PROBABILITY = 0.85      # Require 85% prob for CHAOS (raised from 70%)
 ML_CAUTION_PROBABILITY = 0.75    # 75-85% prob = CAUTION mode
 
-# Risk Limits
-MAX_MARGIN_PCT = 0.40          # Max 40% margin utilization
+# Risk Limits (v2.5: adjusted margin to 40%)
+MAX_MARGIN_PCT = 0.40          # Max 40% margin utilization (relaxed from 20%)
 MAX_LOSS_PER_TRADE = 0.015     # Max 1.5% loss per trade (raised from 1% per Grok Feb 5)
 MAX_DAILY_LOSS = 0.015         # Max 1.5% daily loss (tightened from 3% per Grok Feb 5)
 MAX_WEEKLY_LOSS = 0.05         # Max 5% weekly loss
-MAX_MONTHLY_LOSS = 0.10        # Max 10% monthly loss
+MAX_MONTHLY_LOSS = 0.08        # Max 8% monthly loss (v2.5: tightened from 10%)
 MAX_POSITIONS = 10             # Max concurrent positions multiple strategies can have multiple positions. Aggregate margin requirement can be capped here to restrict position sizes.
 
 # Greeks Limits
@@ -75,8 +76,8 @@ FLAT_DAYS_DAILY_LOSS = 1       # 1 flat day after daily loss hit
 FLAT_DAYS_WEEKLY_LOSS = 3      # 3 flat days after weekly loss hit
 FLAT_DAYS_MONTHLY_LOSS = 5     # 5 flat days after monthly loss hit
 
-# Iron Condor Parameters
-IC_SHORT_DELTA = 25            # Short strikes at 25-delta
+# Iron Condor Parameters (v2.5: 30-delta shorts)
+IC_SHORT_DELTA = 30            # Short strikes at 30-delta (v2.5)
 IC_LONG_DELTA = 15             # Long strikes at 15-delta
 IC_PROFIT_TARGET = 0.60        # Exit at 60% of max profit
 IC_STOP_LOSS = 1.0             # Stop at 100% of credit (loss = credit)
@@ -152,3 +153,52 @@ DIVERSIFICATION_REDUCTION = 0.50  # Halve higher-vol asset size
 # Slippage Alert Settings (Section 8 - v2 rulebook)
 SLIPPAGE_ALERT_THRESHOLD = 0.005  # >0.5% slippage triggers alert
 SLIPPAGE_AUTO_CORRECT_THRESHOLD = 0.01  # >1% slippage triggers auto-correct
+
+# ============== v2.5 Rulebook Additions ==============
+
+# Sustained Trigger Counter (Ref L/N)
+SUSTAINED_TRIGGER_DAYS = 2     # Require 2 consecutive days for chaos veto
+WARNING_TRIGGER_DAYS = 1       # Single day = WARNING (tighten size)
+
+# Event Override (Ref J)
+MIN_DTE_EVENT_OVERRIDE = 10    # Allow entry on event if DTE >= 10
+
+# High-IV Boost (Ref K)
+HIGH_IV_BOOST_THRESHOLD = 50   # IV %ile > 50 triggers boost
+HIGH_IV_VIX_DELTA = 5          # VIX > avg + 5% triggers boost
+HIGH_IV_TARGET_MIN = 0.018     # Boosted target: 1.8%
+HIGH_IV_TARGET_MAX = 0.022     # Boosted target: 2.2%
+HIGH_IV_ADJUST_THRESHOLD = -0.003  # Tighten adjust to -0.3% on high IV
+
+# Skew Check (Ref M)
+SKEW_THRESHOLD = 0.05          # Call IV > Put IV + 5% favors risk-reversals
+
+# Kelly Sizing (v2.5)
+KELLY_FRACTION_MIN = 0.5       # Start with 0.5x Kelly
+KELLY_FRACTION_MAX = 0.7       # Max 0.7x Kelly
+KELLY_DEFAULT_WIN_RATE = 0.60  # Default 60% win rate
+KELLY_DEFAULT_WIN_AVG = 0.015  # Default avg win 1.5%
+KELLY_DEFAULT_LOSS_AVG = 0.01  # Default avg loss 1.0%
+
+# Psych Caps (v2.5)
+PSYCH_DRAWDOWN_CAP = -0.02     # Cap to 1 lot if drawdown > -2%
+PSYCH_SENTIMENT_CAP = -0.3     # Cap to 1 lot if sentiment < -0.3
+WARNING_SIZE_CAP = 1           # Force 1 lot on warning state
+
+# Chaos Flat Period (v2.5)
+CHAOS_FLAT_HOURS = 48          # Flat 48hr after DC abnormal > 2 days
+
+# Short-vol Targets (v2.5)
+SHORT_VOL_TARGET_MIN = 0.014   # 1.4% target (low VIX)
+SHORT_VOL_TARGET_MAX = 0.018   # 1.8% target (normal)
+DIRECTIONAL_TARGET_MIN = 0.014 # 1.4% target
+DIRECTIONAL_TARGET_MAX = 0.022 # 2.2% target
+
+# Trailing (v2.5)
+TRAILING_ACTIVATE_PCT = 0.50   # Activate at 50% of target
+TRAILING_POST_ADJUST_TIGHTEN = 0.75  # Tighten to 75% after adjustment
+
+# Max Concurrent Positions (v2.5)
+MAX_NIFTY_POSITIONS = 2        # Max 2 NIFTY positions
+MAX_SECONDARY_POSITIONS = 2    # Max 2 secondary positions
+MIN_DTE_SHORTS = 3             # Avoid <3 days expiry for shorts

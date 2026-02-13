@@ -4,6 +4,7 @@ import { useTradingStore } from '@/stores/tradingStore';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { LogOut, User, ChevronDown, TrendingUp, TrendingDown, Settings2, Plus, X } from 'lucide-react';
+import { SourceBadge } from '@/components/ui/source-badge';
 import api from '@/services/api';
 
 interface IndexQuote {
@@ -170,11 +171,7 @@ export function Header() {
         {/* Status Badges */}
         <div className="flex items-center gap-2">
           {status && (
-            <Badge 
-              variant={status.mode === 'live' ? 'destructive' : status.mode === 'paper' ? 'warning' : 'secondary'}
-            >
-              {status.mode.toUpperCase()}
-            </Badge>
+            <SourceBadge source={status.mode === 'live' ? 'LIVE' : 'PAPER'} size="sm" />
           )}
           {status?.running && (
             <Badge variant="success">RUNNING</Badge>

@@ -217,10 +217,12 @@ class OptionsSimulator:
             
             strike = mid_strike
         else:
-            # For puts, lower strike = more negative delta
-            low_strike = spot * 0.85
-            high_strike = spot * 1.15
-            target = -abs(target_delta)
+            # For puts: higher strike = more negative delta (closer to -1)
+            # lower strike = less negative delta (closer to 0)
+            # We want OTM puts with delta around -0.25
+            low_strike = spot * 0.70  # Far OTM (delta near 0)
+            high_strike = spot * 1.05  # Near ATM (delta near -0.5)
+            target = -abs(target_delta)  # e.g., -0.25
             
             for _ in range(50):
                 mid_strike = (low_strike + high_strike) / 2
@@ -229,10 +231,12 @@ class OptionsSimulator:
                 if abs(delta - target) < 0.001:
                     break
                 
-                if delta < target:
-                    low_strike = mid_strike
-                else:
-                    high_strike = mid_strike
+                # Put delta: higher strike = more negative
+                # If delta is more negative than target, we need lower strike
+                if delta < target:  # e.g., delta=-0.4, target=-0.25
+                    high_strike = mid_strike  # Move down to get less negative delta
+                else:  # delta > target, e.g., delta=-0.1, target=-0.25
+                    low_strike = mid_strike  # Move up to get more negative delta
             
             strike = mid_strike
         

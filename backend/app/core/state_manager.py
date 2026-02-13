@@ -224,6 +224,38 @@ class StateManager:
         
         return 1.0
     
+    def get_trade_stats(self) -> Dict[str, float]:
+        """
+        v2.5: Get trade statistics for Kelly sizing calculation.
+        
+        Returns:
+            Dict with win_rate, avg_win_pct, avg_loss_pct
+        """
+        recent_trades = self._state.get("recent_trade_results", [])
+        
+        if not recent_trades or len(recent_trades) < 5:
+            # Not enough data, return defaults
+            return {
+                "win_rate": 0.55,  # Default 55% win rate
+                "avg_win_pct": 0.015,  # Default 1.5% avg win
+                "avg_loss_pct": 0.01,  # Default 1% avg loss
+                "trade_count": len(recent_trades)
+            }
+        
+        wins = [t for t in recent_trades if t > 0]
+        losses = [t for t in recent_trades if t < 0]
+        
+        win_rate = len(wins) / len(recent_trades) if recent_trades else 0.5
+        avg_win_pct = sum(wins) / len(wins) if wins else 0.015
+        avg_loss_pct = abs(sum(losses) / len(losses)) if losses else 0.01
+        
+        return {
+            "win_rate": win_rate,
+            "avg_win_pct": avg_win_pct,
+            "avg_loss_pct": avg_loss_pct,
+            "trade_count": len(recent_trades)
+        }
+    
     def record_slippage(self, expected_price: float, actual_price: float, 
                         tradingsymbol: str, order_id: str = None) -> Dict[str, Any]:
         """

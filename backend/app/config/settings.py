@@ -9,9 +9,9 @@ from pathlib import Path
 class Settings(BaseSettings):
     """Application settings loaded from environment variables."""
     
-    # API Credentials
-    kite_api_key: str = Field(..., description="KiteConnect API key")
-    kite_api_secret: str = Field(..., description="KiteConnect API secret")
+    # API Credentials (optional for backtesting)
+    kite_api_key: str = Field("", description="KiteConnect API key")
+    kite_api_secret: str = Field("", description="KiteConnect API secret")
     kite_access_token: str = Field("", description="KiteConnect access token")
     
     # Telegram (optional)

@@ -34,6 +34,12 @@ class RiskReversalStrategy:
         self.name = "RISK_REVERSAL"
         self.logger = logger
     
+    def _get_lot_size(self, symbol: str) -> int:
+        """Get lot size from Kite API or use default."""
+        if self.kite and hasattr(self.kite, 'get_lot_size'):
+            return self.kite.get_lot_size(symbol)
+        return self.lot_size
+    
     def check_entry_conditions(self, regime: RegimePacket) -> Tuple[bool, str, str]:
         """
         Check if entry conditions are met.
@@ -99,7 +105,7 @@ class RiskReversalStrategy:
             return None
         
         # Build legs
-        legs = self._build_legs(option_chain, strikes, expiry, direction)
+        legs = self._build_legs(option_chain, strikes, expiry, direction, symbol=regime.symbol)
         if len(legs) != 2:
             return None
         
@@ -110,15 +116,18 @@ class RiskReversalStrategy:
         net_premium = short_leg.entry_price - long_leg.entry_price
         is_credit = net_premium > 0
         
+        # Get dynamic lot size
+        lot_size = self._get_lot_size(regime.symbol)
+        
         # Risk is theoretically unlimited on short side
         # Use a practical stop based on spot movement
         if direction == "BULLISH":
-            max_loss = strikes[0] * self.lot_size * 0.1  # 10% of put strike
+            max_loss = strikes[0] * lot_size * 0.1  # 10% of put strike
         else:
-            max_loss = regime.spot_price * self.lot_size * 0.1  # 10% of spot
+            max_loss = regime.spot_price * lot_size * 0.1  # 10% of spot
         
         # Profit potential is significant on directional move
-        max_profit = regime.spot_price * self.lot_size * 0.05  # 5% move target
+        max_profit = regime.spot_price * lot_size * 0.05  # 5% move target
         
         target_pnl = max_profit * 0.60
         stop_loss = -max_loss * 0.50
@@ -147,7 +156,9 @@ class RiskReversalStrategy:
             days_to_expiry=days_to_expiry,
             regime_at_entry=regime.regime.value,
             entry_reason=f"RR {direction}: RSI={regime.metrics.rsi:.1f}, IV={regime.metrics.iv_percentile:.1f}%",
-            is_intraday=False
+            is_intraday=False,
+            exit_target_low=0.4,  # 40% of max profit as lower target
+            exit_target_high=0.6  # 60% of max profit as upper target
         )
     
     def _select_strikes(
@@ -156,7 +167,7 @@ class RiskReversalStrategy:
         spot: float,
         direction: str
     ) -> Optional[Tuple[float, float]]:
-        """Select strikes for Risk Reversal based on delta (~0.25)."""
+        """Select strikes for Risk Reversal based on delta (~0.25) or percentage fallback."""
         if option_chain.empty:
             return None
         
@@ -166,51 +177,78 @@ class RiskReversalStrategy:
         short_strike = None
         long_strike = None
         
-        if direction == "BULLISH":
-            # Short put with delta ~-0.25 (absolute 0.25)
-            put_delta_diff = float('inf')
-            for _, row in option_chain[option_chain['instrument_type'] == 'PE'].iterrows():
-                delta = row.get('delta', 0)
-                if delta < -0.20 and delta > -0.30:  # OTM put delta range
-                    diff = abs(delta + target_delta)  # delta is negative for puts
-                    if diff < put_delta_diff:
-                        put_delta_diff = diff
-                        short_strike = row['strike']
-            
-            # Long call with delta ~0.25
-            call_delta_diff = float('inf')
-            for _, row in option_chain[option_chain['instrument_type'] == 'CE'].iterrows():
-                delta = row.get('delta', 0)
-                if delta > 0.20 and delta < 0.30:  # OTM call delta range
-                    diff = abs(delta - target_delta)
-                    if diff < call_delta_diff:
-                        call_delta_diff = diff
-                        long_strike = row['strike']
+        # Check if delta values are available in option chain
+        has_delta = 'delta' in option_chain.columns and option_chain['delta'].notna().any() and (option_chain['delta'] != 0).any()
         
-        else:  # BEARISH
-            # Short call with delta ~0.25
-            call_delta_diff = float('inf')
-            for _, row in option_chain[option_chain['instrument_type'] == 'CE'].iterrows():
-                delta = row.get('delta', 0)
-                if delta > 0.20 and delta < 0.30:  # OTM call delta range
-                    diff = abs(delta - target_delta)
-                    if diff < call_delta_diff:
-                        call_delta_diff = diff
-                        short_strike = row['strike']
+        if has_delta:
+            # Use delta-based selection
+            if direction == "BULLISH":
+                # Short put with delta ~-0.25 (absolute 0.25)
+                put_delta_diff = float('inf')
+                for _, row in option_chain[option_chain['instrument_type'] == 'PE'].iterrows():
+                    delta = row.get('delta', 0)
+                    if delta <= -0.15 and delta >= -0.35:  # OTM put delta range (inclusive)
+                        diff = abs(delta + target_delta)  # delta is negative for puts
+                        if diff < put_delta_diff:
+                            put_delta_diff = diff
+                            short_strike = row['strike']
+                
+                # Long call with delta ~0.25
+                call_delta_diff = float('inf')
+                for _, row in option_chain[option_chain['instrument_type'] == 'CE'].iterrows():
+                    delta = row.get('delta', 0)
+                    if delta >= 0.15 and delta <= 0.35:  # OTM call delta range (inclusive)
+                        diff = abs(delta - target_delta)
+                        if diff < call_delta_diff:
+                            call_delta_diff = diff
+                            long_strike = row['strike']
             
-            # Long put with delta ~-0.25 (absolute 0.25)
-            put_delta_diff = float('inf')
-            for _, row in option_chain[option_chain['instrument_type'] == 'PE'].iterrows():
-                delta = row.get('delta', 0)
-                if delta < -0.20 and delta > -0.30:  # OTM put delta range
-                    diff = abs(delta + target_delta)  # delta is negative for puts
-                    if diff < put_delta_diff:
-                        put_delta_diff = diff
-                        long_strike = row['strike']
+            else:  # BEARISH
+                # Short call with delta ~0.25
+                call_delta_diff = float('inf')
+                for _, row in option_chain[option_chain['instrument_type'] == 'CE'].iterrows():
+                    delta = row.get('delta', 0)
+                    if delta >= 0.15 and delta <= 0.35:  # OTM call delta range (inclusive)
+                        diff = abs(delta - target_delta)
+                        if diff < call_delta_diff:
+                            call_delta_diff = diff
+                            short_strike = row['strike']
+                
+                # Long put with delta ~-0.25 (absolute 0.25)
+                put_delta_diff = float('inf')
+                for _, row in option_chain[option_chain['instrument_type'] == 'PE'].iterrows():
+                    delta = row.get('delta', 0)
+                    if delta <= -0.15 and delta >= -0.35:  # OTM put delta range (inclusive)
+                        diff = abs(delta + target_delta)  # delta is negative for puts
+                        if diff < put_delta_diff:
+                            put_delta_diff = diff
+                            long_strike = row['strike']
+        
+        # Fallback to percentage-based selection if delta not available or selection failed
+        if not short_strike or not long_strike:
+            self.logger.info(f"Using percentage-based strike selection for {direction} RR (delta unavailable or no match)")
+            strikes = sorted(option_chain['strike'].unique())
+            
+            if direction == "BULLISH":
+                # Short put: ~3% OTM (below spot)
+                target_short = spot * 0.97
+                short_strike = min([s for s in strikes if s < spot], key=lambda x: abs(x - target_short), default=None)
+                
+                # Long call: ~3% OTM (above spot)
+                target_long = spot * 1.03
+                long_strike = min([s for s in strikes if s > spot], key=lambda x: abs(x - target_long), default=None)
+            else:  # BEARISH
+                # Short call: ~3% OTM (above spot)
+                target_short = spot * 1.03
+                short_strike = min([s for s in strikes if s > spot], key=lambda x: abs(x - target_short), default=None)
+                
+                # Long put: ~3% OTM (below spot)
+                target_long = spot * 0.97
+                long_strike = min([s for s in strikes if s < spot], key=lambda x: abs(x - target_long), default=None)
         
         # Validate strikes
         if not short_strike or not long_strike:
-            self.logger.warning(f"Could not find suitable delta strikes for {direction}: short={short_strike}, long={long_strike}")
+            self.logger.warning(f"Could not find suitable strikes for {direction}: short={short_strike}, long={long_strike}")
             return None
         
         # Ensure proper OTM relationships
@@ -232,7 +270,8 @@ class RiskReversalStrategy:
         option_chain: pd.DataFrame,
         strikes: Tuple[float, float],
         expiry: date,
-        direction: str
+        direction: str,
+        symbol: str = "NIFTY"
     ) -> List[TradeLeg]:
         """Build the two legs of Risk Reversal."""
         short_strike, long_strike = strikes
@@ -268,7 +307,7 @@ class RiskReversalStrategy:
                 strike=strike,
                 expiry=expiry,
                 option_type=opt_type,
-                quantity=self.lot_size,
+                quantity=self._get_lot_size(symbol),
                 entry_price=float(opt.get('ltp', 0)),
                 delta=float(opt.get('delta', 0)),
                 gamma=float(opt.get('gamma', 0)),

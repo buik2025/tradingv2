@@ -79,11 +79,9 @@ class CredentialsManager:
             else:
                 expires_at = now.replace(hour=6, minute=0, second=0, microsecond=0)
             
-            # Create new credentials
+            # Create new credentials with encryption
             creds = KiteCredentials(
                 api_key=api_key,
-                api_secret=api_secret,
-                access_token=access_token,
                 user_id=user_id,
                 user_name=user_name,
                 email=email,
@@ -92,6 +90,9 @@ class CredentialsManager:
                 expires_at=expires_at,
                 is_valid=True
             )
+            # Use setter methods to encrypt sensitive data
+            creds.set_api_secret(api_secret)
+            creds.set_access_token(access_token)
             session.add(creds)
             session.commit()
             
@@ -134,8 +135,8 @@ class CredentialsManager:
                 logger.warning(f"Kite credentials expired at {creds.expires_at}")
                 return {
                     "api_key": creds.api_key,
-                    "api_secret": creds.api_secret,
-                    "access_token": creds.access_token,
+                    "api_secret": creds.get_api_secret(),
+                    "access_token": creds.get_access_token(),
                     "user_id": creds.user_id,
                     "user_name": creds.user_name,
                     "email": creds.email,
@@ -148,8 +149,8 @@ class CredentialsManager:
             
             return {
                 "api_key": creds.api_key,
-                "api_secret": creds.api_secret,
-                "access_token": creds.access_token,
+                "api_secret": creds.get_api_secret(),
+                "access_token": creds.get_access_token(),
                 "user_id": creds.user_id,
                 "user_name": creds.user_name,
                 "email": creds.email,

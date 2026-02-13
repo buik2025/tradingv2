@@ -249,9 +249,27 @@ class StrangleStrategy:
             self.logger.debug("Unsupported option_chain format")
             return None, None
         
-        # Validate strikes
+        # Fallback to percentage-based selection if delta not available
         if not call_strike or not put_strike:
-            self.logger.debug(f"Could not find suitable delta strikes: C={call_strike}, P={put_strike}")
+            self.logger.info("Using percentage-based strike selection for Strangle (delta unavailable)")
+            if isinstance(option_chain, pd.DataFrame):
+                strikes = sorted(option_chain['strike'].unique())
+            elif isinstance(option_chain, dict) and 'calls' in option_chain:
+                strikes = sorted(set(list(option_chain['calls'].keys()) + list(option_chain['puts'].keys())))
+            else:
+                return None, None
+            
+            # Call: ~3% OTM (above spot)
+            target_call = spot * 1.03
+            call_strike = min([s for s in strikes if s > spot], key=lambda x: abs(x - target_call), default=None)
+            
+            # Put: ~3% OTM (below spot)
+            target_put = spot * 0.97
+            put_strike = min([s for s in strikes if s < spot], key=lambda x: abs(x - target_put), default=None)
+        
+        # Final validation
+        if not call_strike or not put_strike:
+            self.logger.debug(f"Could not find suitable strikes: C={call_strike}, P={put_strike}")
             return None, None
         
         # Ensure strikes are OTM

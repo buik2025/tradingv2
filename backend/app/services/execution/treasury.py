@@ -8,6 +8,7 @@ from ..agents import BaseAgent
 from ...core.kite_client import KiteClient
 from ...core.state_manager import StateManager
 from ...config.settings import Settings
+from .circuit_breaker import CircuitBreaker, CircuitBreakerState
 from ...config.thresholds import (
     MAX_MARGIN_PCT, MAX_LOSS_PER_TRADE, MAX_DAILY_LOSS, MAX_WEEKLY_LOSS,
     MAX_POSITIONS, MAX_DELTA, MAX_GAMMA, MAX_VEGA,
@@ -17,7 +18,12 @@ from ...config.thresholds import (
     # New thresholds for Section 5/6/7
     CONSECUTIVE_LOSERS_REDUCTION, WIN_STREAK_SIZE_CAP,
     LOW_VIX_THRESHOLD, LOW_VIX_MARGIN_BONUS,
-    DIVERSIFICATION_CORR_THRESHOLD, DIVERSIFICATION_REDUCTION
+    DIVERSIFICATION_CORR_THRESHOLD, DIVERSIFICATION_REDUCTION,
+    # v2.5 thresholds
+    KELLY_FRACTION_MIN, KELLY_FRACTION_MAX,
+    KELLY_DEFAULT_WIN_RATE, KELLY_DEFAULT_WIN_AVG, KELLY_DEFAULT_LOSS_AVG,
+    PSYCH_DRAWDOWN_CAP, PSYCH_SENTIMENT_CAP, WARNING_SIZE_CAP,
+    MAX_NIFTY_POSITIONS, MAX_SECONDARY_POSITIONS
 )
 from ...models.trade import TradeProposal, TradeSignal
 from ...models.position import AccountState, Position
@@ -49,11 +55,16 @@ class Treasury(BaseAgent):
         kite: KiteClient,
         config: Settings,
         state_manager: Optional[StateManager] = None,
-        paper_mode: bool = False
+        paper_mode: bool = False,
+        circuit_breaker: Optional[CircuitBreaker] = None
     ):
         super().__init__(kite, config, name="Treasury")
         self.state_manager = state_manager or StateManager()
         self.paper_mode = paper_mode
+        
+        # Initialize CircuitBreaker with paper or live equity
+        initial_equity = self.PAPER_EQUITY if paper_mode else 100000.0
+        self.circuit_breaker = circuit_breaker or CircuitBreaker(initial_equity=initial_equity)
     
     def process(
         self,
@@ -118,8 +129,25 @@ class Treasury(BaseAgent):
             elif self.state_manager.get("win_streak_cap_active", False):
                 streak_reason = f", win streak cap {streak_multiplier:.0%}"
         
-        # 9. Calculate final multiplier (combine all adjustments)
-        final_multiplier = dd_multiplier * streak_multiplier * diversification_multiplier
+        # 9. v2.5: Get Kelly-based sizing multiplier
+        kelly_multiplier = self._get_kelly_multiplier(account)
+        
+        # 10. v2.5: Get psych cap multiplier (drawdown > -2% or sentiment < -0.3)
+        psych_multiplier, psych_reason = self._get_psych_cap_multiplier(account)
+        if psych_reason:
+            streak_reason += f", {psych_reason}"
+        
+        # 11. v2.5: Check warning state from regime (force 1 lot)
+        warning_multiplier = 1.0
+        if hasattr(proposal, 'regime_warning') and proposal.regime_warning:
+            warning_multiplier = 0.33  # Force ~1 lot (assuming 3 lots max)
+            streak_reason += ", v2.5 warning state"
+        
+        # 12. Calculate final multiplier (combine all adjustments)
+        final_multiplier = (
+            dd_multiplier * streak_multiplier * diversification_multiplier *
+            kelly_multiplier * psych_multiplier * warning_multiplier
+        )
         
         # 10. Adjust size based on all multipliers
         adjusted_margin = proposal.required_margin * final_multiplier
@@ -148,9 +176,31 @@ class Treasury(BaseAgent):
         return True, signal, "Approved"
     
     def _check_circuit_breakers(self, account: AccountState) -> bool:
-        """Check if any circuit breakers are active."""
+        """
+        Check if any circuit breakers are active.
+        
+        Uses the CircuitBreaker service for comprehensive tracking:
+        - Daily loss limit (-1.5%)
+        - Weekly loss limit (-4%)
+        - Monthly loss limit (-10%)
+        - Consecutive losses (3 losers)
+        - ML preemptive halt (loss prob > 0.6)
+        """
+        # Update circuit breaker with current equity
+        self.circuit_breaker.update_equity(account.equity)
+        
+        # Check circuit breaker service
+        if self.circuit_breaker.is_halted():
+            status = self.circuit_breaker.get_status()
+            self.logger.warning(
+                f"CircuitBreaker HALTED: {status['halt_reason']} "
+                f"(state: {status['state']}, until: {status.get('halt_until', 'N/A')})"
+            )
+            return False
+        
+        # Also check legacy account-level flags for backward compatibility
         if account.circuit_breaker_active:
-            self.logger.warning(f"Circuit breaker active: {account.circuit_breaker_reason}")
+            self.logger.warning(f"Account circuit breaker active: {account.circuit_breaker_reason}")
             return False
         
         if account.flat_days_remaining > 0:
@@ -158,6 +208,52 @@ class Treasury(BaseAgent):
             return False
         
         return True
+    
+    def record_trade_result(
+        self,
+        pnl: float,
+        is_win: bool,
+        ml_loss_prob: Optional[float] = None
+    ) -> Dict:
+        """
+        Record trade result in circuit breaker for loss tracking.
+        
+        Should be called by Executor after each trade closes.
+        
+        Args:
+            pnl: Trade P&L amount
+            is_win: Whether trade was profitable
+            ml_loss_prob: Optional ML-predicted loss probability for next trade
+            
+        Returns:
+            Circuit breaker status after recording
+        """
+        state = self.circuit_breaker.record_trade(
+            pnl=pnl,
+            is_win=is_win,
+            ml_loss_prob=ml_loss_prob
+        )
+        
+        status = self.circuit_breaker.get_status()
+        
+        if state != CircuitBreakerState.ACTIVE:
+            self.logger.warning(
+                f"Circuit breaker triggered: {state.value} - {status['halt_reason']}"
+            )
+        
+        return status
+    
+    def get_circuit_breaker_status(self) -> Dict:
+        """Get current circuit breaker status."""
+        return self.circuit_breaker.get_status()
+    
+    def get_size_multiplier_from_circuit_breaker(self) -> float:
+        """
+        Get position size multiplier from circuit breaker.
+        
+        Returns 0.5 if size reduction is active (after consecutive losses).
+        """
+        return self.circuit_breaker.get_size_multiplier()
     
     def _check_position_count(self, account: AccountState) -> bool:
         """Check if position count is within limit."""
@@ -283,6 +379,77 @@ class Treasury(BaseAgent):
                 return DIVERSIFICATION_REDUCTION
         
         return 1.0
+    
+    def _get_kelly_multiplier(self, account: AccountState) -> float:
+        """
+        v2.5: Calculate Kelly-based position sizing multiplier.
+        
+        Kelly formula: f = (win_p * avg_win - loss_p * avg_loss) / (avg_win * loss_p)
+        Use fractional Kelly (0.5-0.7x) for safety.
+        
+        Returns:
+            Multiplier based on Kelly criterion (0.5-1.0)
+        """
+        # Get historical stats from state manager
+        stats = self.state_manager.get_trade_stats()
+        
+        win_rate = stats.get('win_rate', KELLY_DEFAULT_WIN_RATE)
+        avg_win = stats.get('avg_win_pct', KELLY_DEFAULT_WIN_AVG)
+        avg_loss = stats.get('avg_loss_pct', KELLY_DEFAULT_LOSS_AVG)
+        
+        # Ensure valid values
+        if win_rate <= 0 or win_rate >= 1 or avg_win <= 0 or avg_loss <= 0:
+            return KELLY_FRACTION_MIN  # Conservative default
+        
+        loss_rate = 1 - win_rate
+        
+        # Kelly formula
+        if avg_win * loss_rate > 0:
+            kelly_f = (win_rate * avg_win - loss_rate * avg_loss) / (avg_win * loss_rate)
+        else:
+            kelly_f = 0
+        
+        # Clamp to valid range
+        if kelly_f <= 0:
+            self.logger.warning(f"v2.5 Kelly: Negative edge ({kelly_f:.2f}), using minimum")
+            return KELLY_FRACTION_MIN
+        
+        # Apply fractional Kelly (0.5-0.7x)
+        fractional_kelly = kelly_f * KELLY_FRACTION_MIN
+        
+        # Clamp to max
+        result = min(fractional_kelly, KELLY_FRACTION_MAX)
+        
+        self.logger.debug(
+            f"v2.5 Kelly: win_rate={win_rate:.1%}, avg_win={avg_win:.2%}, "
+            f"avg_loss={avg_loss:.2%}, kelly_f={kelly_f:.2f}, result={result:.2f}"
+        )
+        
+        return result
+    
+    def _get_psych_cap_multiplier(self, account: AccountState) -> Tuple[float, str]:
+        """
+        v2.5: Get psych cap multiplier.
+        
+        Cap to 1 lot if:
+        - Drawdown > -2%
+        - Sentiment < -0.3 (from SMEI)
+        
+        Returns:
+            Tuple of (multiplier, reason string)
+        """
+        # Check drawdown cap
+        if account.drawdown_pct < PSYCH_DRAWDOWN_CAP:  # Note: drawdown is negative
+            self.logger.info(f"v2.5 Psych cap: Drawdown {account.drawdown_pct:.1%} < {PSYCH_DRAWDOWN_CAP:.1%}")
+            return 0.33, "psych drawdown cap"  # ~1 lot
+        
+        # Check sentiment cap (if available in state)
+        sentiment = self.state_manager.get('smei_score', 0.0)
+        if sentiment < PSYCH_SENTIMENT_CAP:
+            self.logger.info(f"v2.5 Psych cap: Sentiment {sentiment:.2f} < {PSYCH_SENTIMENT_CAP:.1f}")
+            return 0.33, "psych sentiment cap"  # ~1 lot
+        
+        return 1.0, ""
     
     def check_loss_limits(self, account: AccountState) -> Tuple[bool, Optional[str], int]:
         """

@@ -1,13 +1,15 @@
 """Authentication endpoints for KiteConnect OAuth"""
 
-from fastapi import APIRouter, HTTPException, Response, Request
+from fastapi import APIRouter, HTTPException, Response, Request, BackgroundTasks
 from pydantic import BaseModel
 from typing import Optional
 from loguru import logger
 
 from ..config.settings import Settings
 from ..core.kite_client import KiteClient
-from ..core.credentials import save_kite_credentials, get_kite_credentials
+from ..core.credentials import get_kite_credentials
+from ..core.kite_provider import set_kite_credentials_from_login, get_kite_client, invalidate_kite_clients
+from ..services.reconciliation import run_reconciliation_async
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -40,12 +42,13 @@ async def get_login_url():
 
 
 @router.post("/callback")
-async def auth_callback(request: CallbackRequest, response: Response):
+async def auth_callback(request: CallbackRequest, response: Response, background_tasks: BackgroundTasks):
     """Exchange request token for access token."""
     config = get_settings()
     
     try:
-        kite = KiteClient(
+        # Create temporary client just for session generation
+        temp_kite = KiteClient(
             api_key=config.kite_api_key,
             access_token="",
             paper_mode=True,
@@ -53,7 +56,7 @@ async def auth_callback(request: CallbackRequest, response: Response):
         )
         
         # Generate session
-        session_data = kite.generate_session(request.request_token, config.kite_api_secret)
+        session_data = temp_kite.generate_session(request.request_token, config.kite_api_secret)
         access_token = session_data.get("access_token")
         
         if not access_token:
@@ -62,8 +65,9 @@ async def auth_callback(request: CallbackRequest, response: Response):
         # Get user profile
         user_data = session_data.get("user", {})
         
-        # Save credentials to PostgreSQL for use by scripts
-        save_kite_credentials(
+        # Use KiteClientProvider to save credentials and create the official client
+        # This is THE SINGLE SOURCE OF TRUTH for KiteClient instances
+        kite = set_kite_credentials_from_login(
             api_key=config.kite_api_key,
             api_secret=config.kite_api_secret,
             access_token=access_token,
@@ -71,7 +75,11 @@ async def auth_callback(request: CallbackRequest, response: Response):
             user_name=user_data.get("user_name"),
             email=user_data.get("email")
         )
-        logger.info(f"Saved Kite credentials to database for user: {user_data.get('user_id')}")
+        
+        if not kite:
+            raise HTTPException(status_code=500, detail="Failed to create KiteClient after login")
+        
+        logger.info(f"KiteClientProvider: Created client for user: {user_data.get('user_id')}")
         
         # Store session in memory
         session_id = f"session_{user_data.get('user_id', 'unknown')}"
@@ -90,6 +98,14 @@ async def auth_callback(request: CallbackRequest, response: Response):
         )
         
         logger.info(f"User logged in: {user_data.get('user_id')}")
+        
+        # Trigger position reconciliation in background after login
+        background_tasks.add_task(
+            run_reconciliation_async,
+            config.kite_api_key,
+            access_token
+        )
+        logger.info("Scheduled position reconciliation after login")
         
         return {
             "user": {
@@ -112,6 +128,10 @@ async def logout(request: Request, response: Response):
     
     if session_id and session_id in _sessions:
         del _sessions[session_id]
+    
+    # Invalidate KiteClientProvider cached clients
+    invalidate_kite_clients()
+    logger.info("Invalidated KiteClientProvider on logout")
     
     response.delete_cookie("session_id")
     return {"message": "Logged out"}

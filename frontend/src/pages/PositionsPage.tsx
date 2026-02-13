@@ -5,9 +5,11 @@
 import React, { useState, useMemo, useEffect, useCallback } from 'react';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
+import { SourceBadge } from '@/components/ui/source-badge';
 import { Button } from '@/components/ui/button';
 import { formatCurrency, formatPercent } from '@/lib/utils';
-import { ArrowUpDown, ArrowUp, ArrowDown, Search, X, Plus, RefreshCw, Wifi, WifiOff } from 'lucide-react';
+import { ArrowUpDown, ArrowUp, ArrowDown, Search, X, Plus, RefreshCw } from 'lucide-react';
+import { ConnectionBadge } from '@/components/ui/connection-badge';
 import { strategiesApi } from '@/services/api';
 import { portfolioApi, type Position, type PositionsResponse } from '@/services/portfolioApi';
 import { useWebSocket } from '@/hooks/useWebSocket';
@@ -37,6 +39,12 @@ export function PositionsPage() {
   const [showCreateStrategy, setShowCreateStrategy] = useState(false);
   const [newStrategyName, setNewStrategyName] = useState('');
   const [creatingStrategy, setCreatingStrategy] = useState(false);
+  
+  // Trailing stop config for strategy creation
+  const [trailingStopEnabled, setTrailingStopEnabled] = useState(false);
+  const [trailingActivationPct, setTrailingActivationPct] = useState(0.8);
+  const [trailingStepPct, setTrailingStepPct] = useState(0.1);
+  const [trailingLockPct, setTrailingLockPct] = useState(0.05);
 
   const fetchData = useCallback(async () => {
     setIsRefreshing(true);
@@ -207,10 +215,21 @@ export function PositionsPage() {
       await strategiesApi.create({
         name: newStrategyName,
         position_ids: Array.from(selectedPositions),
+        trailing_stop: {
+          enabled: trailingStopEnabled,
+          activation_pct: trailingActivationPct,
+          step_pct: trailingStepPct,
+          lock_pct: trailingLockPct,
+        },
       });
       setSelectedPositions(new Set());
       setShowCreateStrategy(false);
       setNewStrategyName('');
+      // Reset trailing stop config to defaults
+      setTrailingStopEnabled(false);
+      setTrailingActivationPct(0.8);
+      setTrailingStepPct(0.1);
+      setTrailingLockPct(0.05);
     } catch (error) {
       console.error('Failed to create strategy:', error);
     } finally {
@@ -230,15 +249,7 @@ export function PositionsPage() {
           <p className="text-[var(--muted-foreground)]">Manage your open positions with margin tracking</p>
         </div>
         <div className="flex items-center gap-2">
-          {connected ? (
-            <Badge variant="outline" className="text-[var(--profit)] border-[var(--profit)]">
-              <Wifi className="h-3 w-3 mr-1" /> Live
-            </Badge>
-          ) : (
-            <Badge variant="outline" className="text-[var(--muted-foreground)]">
-              <WifiOff className="h-3 w-3 mr-1" /> Offline
-            </Badge>
-          )}
+          <ConnectionBadge connected={connected} />
         </div>
       </div>
 
@@ -490,23 +501,14 @@ export function PositionsPage() {
                             <Badge variant="outline">{position.exchange}</Badge>
                           </td>
                           <td className="py-3 px-4">
-                            <Badge
-                              variant="outline"
-                              className={
-                                position.source === 'PAPER'
-                                  ? 'text-[var(--primary)] border-[var(--primary)]'
-                                  : 'text-[var(--muted-foreground)]'
-                              }
-                            >
-                              {position.source === 'PAPER' ? 'Paper' : 'Live'}
-                            </Badge>
+                            <SourceBadge source={position.source as 'LIVE' | 'PAPER'} />
                           </td>
                           <td className="py-3 px-4 text-right">{position.quantity}</td>
                           <td className="py-3 px-4 text-right">{formatCurrency(position.average_price)}</td>
                           <td className="py-3 px-4 text-right">
                             <div>{formatCurrency(position.last_price)}</div>
                             <div className={`text-xs ${(position.ltp_change_pct || 0) >= 0 ? 'text-[var(--profit)]' : 'text-[var(--loss)]'}`}>
-                              {(position.ltp_change_pct || 0) >= 0 ? '+' : ''}{formatPercent(position.ltp_change_pct || 0)}
+                              {formatPercent(position.ltp_change_pct || 0)}
                             </div>
                           </td>
                           <td className={`py-3 px-4 text-right font-medium ${position.pnl >= 0 ? 'text-[var(--profit)]' : 'text-[var(--loss)]'}`}>
@@ -571,23 +573,14 @@ export function PositionsPage() {
                         <Badge variant="outline">{position.exchange}</Badge>
                       </td>
                       <td className="py-3 px-4">
-                        <Badge
-                          variant="outline"
-                          className={
-                            position.source === 'PAPER'
-                              ? 'text-[var(--primary)] border-[var(--primary)]'
-                              : 'text-[var(--muted-foreground)]'
-                          }
-                        >
-                          {position.source === 'PAPER' ? 'Paper' : 'Live'}
-                        </Badge>
+                        <SourceBadge source={position.source as 'LIVE' | 'PAPER'} />
                       </td>
                       <td className="py-3 px-4 text-right">{position.quantity}</td>
                       <td className="py-3 px-4 text-right">{formatCurrency(position.average_price)}</td>
                       <td className="py-3 px-4 text-right">
                         <div>{formatCurrency(position.last_price)}</div>
                         <div className={`text-xs ${(position.ltp_change_pct || 0) >= 0 ? 'text-[var(--profit)]' : 'text-[var(--loss)]'}`}>
-                          {(position.ltp_change_pct || 0) >= 0 ? '+' : ''}{formatPercent(position.ltp_change_pct || 0)}
+                          {formatPercent(position.ltp_change_pct || 0)}
                         </div>
                       </td>
                       <td className={`py-3 px-4 text-right font-medium ${position.pnl >= 0 ? 'text-[var(--profit)]' : 'text-[var(--loss)]'}`}>
@@ -652,7 +645,7 @@ export function PositionsPage() {
       {/* Create Strategy Modal */}
       {showCreateStrategy && (
         <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
-          <Card className="w-96">
+          <Card className="w-[480px]">
             <CardHeader>
               <CardTitle>Create Strategy</CardTitle>
             </CardHeader>
@@ -670,6 +663,74 @@ export function PositionsPage() {
               <p className="text-sm text-[var(--muted-foreground)]">
                 {selectedPositions.size} position{selectedPositions.size !== 1 ? 's' : ''} will be added to this strategy.
               </p>
+              
+              {/* Trailing Stop Configuration */}
+              <div className="border border-[var(--border)] rounded-lg p-4 space-y-3">
+                <div className="flex items-center justify-between">
+                  <label className="text-sm font-medium">Trailing Stop-Loss</label>
+                  <button
+                    type="button"
+                    onClick={() => setTrailingStopEnabled(!trailingStopEnabled)}
+                    className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
+                      trailingStopEnabled ? 'bg-[var(--primary)]' : 'bg-[var(--muted)]'
+                    }`}
+                  >
+                    <span
+                      className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
+                        trailingStopEnabled ? 'translate-x-6' : 'translate-x-1'
+                      }`}
+                    />
+                  </button>
+                </div>
+                
+                {trailingStopEnabled && (
+                  <div className="space-y-3 pt-2 border-t border-[var(--border)]">
+                    <p className="text-xs text-[var(--muted-foreground)]">
+                      Automatically trail profits when P&L exceeds activation threshold.
+                    </p>
+                    <div className="grid grid-cols-3 gap-3">
+                      <div>
+                        <label className="text-xs text-[var(--muted-foreground)]">Activation %</label>
+                        <input
+                          type="number"
+                          step="0.1"
+                          value={trailingActivationPct}
+                          onChange={(e) => setTrailingActivationPct(parseFloat(e.target.value) || 0.8)}
+                          className="w-full mt-1 px-2 py-1.5 text-sm bg-[var(--background)] border border-[var(--border)] rounded-md focus:outline-none focus:ring-1 focus:ring-[var(--primary)]"
+                        />
+                        <p className="text-[10px] text-[var(--muted-foreground)] mt-0.5">of margin</p>
+                      </div>
+                      <div>
+                        <label className="text-xs text-[var(--muted-foreground)]">Step %</label>
+                        <input
+                          type="number"
+                          step="0.05"
+                          value={trailingStepPct}
+                          onChange={(e) => setTrailingStepPct(parseFloat(e.target.value) || 0.1)}
+                          className="w-full mt-1 px-2 py-1.5 text-sm bg-[var(--background)] border border-[var(--border)] rounded-md focus:outline-none focus:ring-1 focus:ring-[var(--primary)]"
+                        />
+                        <p className="text-[10px] text-[var(--muted-foreground)] mt-0.5">P&L increase</p>
+                      </div>
+                      <div>
+                        <label className="text-xs text-[var(--muted-foreground)]">Lock %</label>
+                        <input
+                          type="number"
+                          step="0.01"
+                          value={trailingLockPct}
+                          onChange={(e) => setTrailingLockPct(parseFloat(e.target.value) || 0.05)}
+                          className="w-full mt-1 px-2 py-1.5 text-sm bg-[var(--background)] border border-[var(--border)] rounded-md focus:outline-none focus:ring-1 focus:ring-[var(--primary)]"
+                        />
+                        <p className="text-[10px] text-[var(--muted-foreground)] mt-0.5">per step</p>
+                      </div>
+                    </div>
+                    <p className="text-xs text-[var(--muted-foreground)] bg-[var(--muted)] p-2 rounded">
+                      When P&L ≥ {trailingActivationPct}% of margin, lock in profits. 
+                      Every {trailingStepPct}% increase raises floor by {trailingLockPct}%.
+                    </p>
+                  </div>
+                )}
+              </div>
+              
               <div className="flex gap-2 justify-end">
                 <Button variant="outline" onClick={() => setShowCreateStrategy(false)}>
                   Cancel

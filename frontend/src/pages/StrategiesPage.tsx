@@ -6,10 +6,12 @@ import { useEffect, useState, useCallback, useMemo } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
+import { SourceBadge } from '@/components/ui/source-badge';
 import { Button } from '@/components/ui/button';
 import { formatCurrency, formatPercent } from '@/lib/utils';
-import { ChevronDown, ChevronRight, RefreshCw, Wifi, WifiOff, Trash2 } from 'lucide-react';
-import { strategiesApi } from '@/services/api';
+import { ChevronDown, ChevronRight, RefreshCw, Trash2, Shield, ShieldCheck, TrendingUp } from 'lucide-react';
+import { ConnectionBadge } from '@/components/ui/connection-badge';
+import { strategiesApi, trailingStopApi, type TrailingStopStatus } from '@/services/api';
 import { portfolioApi, type StrategiesResponse } from '@/services/portfolioApi';
 import { useWebSocket } from '@/hooks/useWebSocket';
 
@@ -24,6 +26,18 @@ export function StrategiesPage() {
   const [isLoading, setIsLoading] = useState(true);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [filterSource, setFilterSource] = useState<'all' | 'LIVE' | 'PAPER'>('all');
+  
+  // Trailing stop state
+  const [trailingStopStatuses, setTrailingStopStatuses] = useState<Record<string, TrailingStopStatus>>({});
+  const [trailingStopLoading, setTrailingStopLoading] = useState<Set<string>>(new Set());
+  const [monitorRunning, setMonitorRunning] = useState(false);
+  
+  // Trailing stop config edit modal state
+  const [editingTrailingStop, setEditingTrailingStop] = useState<string | null>(null);
+  const [editActivationPct, setEditActivationPct] = useState(0.8);
+  const [editStepPct, setEditStepPct] = useState(0.1);
+  const [editLockPct, setEditLockPct] = useState(0.05);
+  const [savingConfig, setSavingConfig] = useState(false);
 
   const fetchData = useCallback(async () => {
     setIsRefreshing(true);
@@ -117,6 +131,96 @@ export function StrategiesPage() {
     }
   };
 
+  // Trailing stop handlers
+  const fetchTrailingStopStatus = useCallback(async (strategyId: string) => {
+    try {
+      const response = await strategiesApi.getTrailingStopStatus(strategyId);
+      setTrailingStopStatuses(prev => ({ ...prev, [strategyId]: response.data }));
+    } catch (error) {
+      console.error('Failed to fetch trailing stop status:', error);
+    }
+  }, []);
+
+  const handleToggleTrailingStop = async (strategyId: string, currentlyEnabled: boolean) => {
+    setTrailingStopLoading(prev => new Set([...prev, strategyId]));
+    try {
+      if (currentlyEnabled) {
+        await strategiesApi.disableTrailingStop(strategyId);
+      } else {
+        await strategiesApi.enableTrailingStop(strategyId, {
+          activation_pct: 0.8,
+          step_pct: 0.1,
+          lock_pct: 0.05
+        });
+      }
+      await fetchTrailingStopStatus(strategyId);
+    } catch (error) {
+      console.error('Failed to toggle trailing stop:', error);
+    } finally {
+      setTrailingStopLoading(prev => {
+        const next = new Set(prev);
+        next.delete(strategyId);
+        return next;
+      });
+    }
+  };
+
+  const handleStartMonitor = async () => {
+    try {
+      await trailingStopApi.start(5);
+      setMonitorRunning(true);
+    } catch (error) {
+      console.error('Failed to start trailing stop monitor:', error);
+    }
+  };
+
+  const handleStopMonitor = async () => {
+    try {
+      await trailingStopApi.stop();
+      setMonitorRunning(false);
+    } catch (error) {
+      console.error('Failed to stop trailing stop monitor:', error);
+    }
+  };
+
+  const openEditTrailingStop = (strategyId: string) => {
+    const status = trailingStopStatuses[strategyId];
+    if (status) {
+      setEditActivationPct(status.config.activation_pct);
+      setEditStepPct(status.config.step_pct);
+      setEditLockPct(status.config.lock_pct);
+    }
+    setEditingTrailingStop(strategyId);
+  };
+
+  const handleSaveTrailingStopConfig = async () => {
+    if (!editingTrailingStop) return;
+    
+    setSavingConfig(true);
+    try {
+      await strategiesApi.updateTrailingStopConfig(editingTrailingStop, {
+        activation_pct: editActivationPct,
+        step_pct: editStepPct,
+        lock_pct: editLockPct,
+      });
+      await fetchTrailingStopStatus(editingTrailingStop);
+      setEditingTrailingStop(null);
+    } catch (error) {
+      console.error('Failed to save trailing stop config:', error);
+    } finally {
+      setSavingConfig(false);
+    }
+  };
+
+  // Fetch trailing stop status for expanded strategies
+  useEffect(() => {
+    expandedStrategies.forEach(strategyId => {
+      if (!trailingStopStatuses[strategyId]) {
+        fetchTrailingStopStatus(strategyId);
+      }
+    });
+  }, [expandedStrategies, trailingStopStatuses, fetchTrailingStopStatus]);
+
   if (isLoading) {
     return <div className="text-center py-8 text-[var(--muted-foreground)]">Loading strategies...</div>;
   }
@@ -129,15 +233,17 @@ export function StrategiesPage() {
           <p className="text-[var(--muted-foreground)]">Manage your trading strategies with margin tracking</p>
         </div>
         <div className="flex items-center gap-2">
-          {connected ? (
-            <Badge variant="outline" className="text-[var(--profit)] border-[var(--profit)]">
-              <Wifi className="h-3 w-3 mr-1" /> Live
-            </Badge>
+          {/* Trailing Stop Monitor Controls */}
+          {monitorRunning ? (
+            <Button variant="outline" size="sm" onClick={handleStopMonitor} className="text-[var(--loss)]">
+              <Shield className="h-4 w-4 mr-1" /> Stop Monitor
+            </Button>
           ) : (
-            <Badge variant="outline" className="text-[var(--muted-foreground)]">
-              <WifiOff className="h-3 w-3 mr-1" /> Offline
-            </Badge>
+            <Button variant="outline" size="sm" onClick={handleStartMonitor} className="text-[var(--profit)]">
+              <ShieldCheck className="h-4 w-4 mr-1" /> Start Monitor
+            </Button>
           )}
+          <ConnectionBadge connected={connected} />
         </div>
       </div>
 
@@ -210,12 +316,15 @@ export function StrategiesPage() {
                       ) : (
                         <ChevronRight className="h-5 w-5" />
                       )}
-                      <div>
-                        <h3 className="font-semibold">{strategy.name}</h3>
-                        <p className="text-sm text-[var(--muted-foreground)]">
-                          {strategy.trades_count} trade{strategy.trades_count !== 1 ? 's' : ''} · {strategy.status}
-                          {strategy.label && ` · ${strategy.label}`}
-                        </p>
+                      <div className="flex items-center gap-2">
+                        <div>
+                          <h3 className="font-semibold">{strategy.name}</h3>
+                          <p className="text-sm text-[var(--muted-foreground)]">
+                            {strategy.trades_count} trade{strategy.trades_count !== 1 ? 's' : ''} · {strategy.status}
+                            {strategy.label && ` · ${strategy.label}`}
+                          </p>
+                        </div>
+                        <SourceBadge source={(strategy.source || 'LIVE') as 'LIVE' | 'PAPER'} size="sm" />
                       </div>
                     </div>
                     <div className="flex items-center gap-6">
@@ -236,6 +345,27 @@ export function StrategiesPage() {
                           {formatPercent(strategy.pnl_on_margin_pct)}
                         </p>
                       </div>
+                      {/* Trailing Stop Toggle */}
+                      <Button 
+                        variant="ghost" 
+                        size="sm" 
+                        onClick={(e) => { 
+                          e.stopPropagation(); 
+                          const status = trailingStopStatuses[strategy.id];
+                          handleToggleTrailingStop(strategy.id, status?.enabled || false);
+                        }}
+                        disabled={trailingStopLoading.has(strategy.id)}
+                        className={trailingStopStatuses[strategy.id]?.enabled 
+                          ? "text-[var(--profit)]" 
+                          : "text-[var(--muted-foreground)] hover:text-[var(--profit)]"}
+                        title={trailingStopStatuses[strategy.id]?.enabled ? "Disable Trailing Stop" : "Enable Trailing Stop"}
+                      >
+                        {trailingStopStatuses[strategy.id]?.enabled ? (
+                          <ShieldCheck className="h-4 w-4" />
+                        ) : (
+                          <Shield className="h-4 w-4" />
+                        )}
+                      </Button>
                       <Button 
                         variant="ghost" 
                         size="sm" 
@@ -246,6 +376,63 @@ export function StrategiesPage() {
                       </Button>
                     </div>
                   </div>
+                  
+                  {/* Trailing Stop Status Bar */}
+                  {trailingStopStatuses[strategy.id]?.enabled && (
+                    <div className="px-4 py-2 bg-[var(--muted)]/50 border-t border-[var(--border)] flex items-center justify-between text-sm">
+                      <div className="flex items-center gap-4">
+                        <span className="text-[var(--muted-foreground)]">
+                          <TrendingUp className="h-4 w-4 inline mr-1" />
+                          Trailing Stop
+                        </span>
+                        {trailingStopStatuses[strategy.id]?.state.is_active ? (
+                          <Badge variant="outline" className="text-[var(--profit)] border-[var(--profit)]">
+                            Active
+                          </Badge>
+                        ) : (
+                          <Badge variant="outline" className="text-[var(--muted-foreground)]">
+                            Waiting (≥{trailingStopStatuses[strategy.id]?.config.activation_pct}%)
+                          </Badge>
+                        )}
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          onClick={(e) => { e.stopPropagation(); openEditTrailingStop(strategy.id); }}
+                          className="text-xs text-[var(--muted-foreground)] hover:text-[var(--foreground)] h-6 px-2"
+                        >
+                          Edit Config
+                        </Button>
+                      </div>
+                      <div className="flex items-center gap-4 text-xs">
+                        {trailingStopStatuses[strategy.id]?.state.floor_pct !== null && (
+                          <span>
+                            Floor: <span className="text-[var(--profit)] font-medium">
+                              {trailingStopStatuses[strategy.id]?.state.floor_pct?.toFixed(3)}%
+                            </span>
+                          </span>
+                        )}
+                        {trailingStopStatuses[strategy.id]?.state.high_water_pct !== null && (
+                          <span>
+                            High: <span className="font-medium">
+                              {trailingStopStatuses[strategy.id]?.state.high_water_pct?.toFixed(3)}%
+                            </span>
+                          </span>
+                        )}
+                        {trailingStopStatuses[strategy.id]?.state.current_pnl_pct !== null && (
+                          <span>
+                            Current: <span className={`font-medium ${(trailingStopStatuses[strategy.id]?.state.current_pnl_pct || 0) >= 0 ? 'text-[var(--profit)]' : 'text-[var(--loss)]'}`}>
+                              {trailingStopStatuses[strategy.id]?.state.current_pnl_pct?.toFixed(3)}%
+                            </span>
+                          </span>
+                        )}
+                        {(trailingStopStatuses[strategy.id]?.state.sl_order_ids?.length || 0) > 0 && (
+                          <span className="text-[var(--muted-foreground)]">
+                            SL Orders: {trailingStopStatuses[strategy.id]?.state.sl_order_ids?.length}
+                          </span>
+                        )}
+                      </div>
+                    </div>
+                  )}
                   
                   {/* Expanded Trades */}
                   {expandedStrategies.has(strategy.id) && strategy.trades.length > 0 && (
@@ -322,6 +509,72 @@ export function StrategiesPage() {
           )}
         </CardContent>
       </Card>
+
+      {/* Edit Trailing Stop Config Modal */}
+      {editingTrailingStop && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
+          <Card className="w-[420px]">
+            <CardHeader>
+              <CardTitle>Edit Trailing Stop Config</CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-4">
+              <p className="text-sm text-[var(--muted-foreground)]">
+                Adjust the trailing stop parameters for this strategy.
+              </p>
+              
+              <div className="grid grid-cols-3 gap-3">
+                <div>
+                  <label className="text-xs text-[var(--muted-foreground)]">Activation %</label>
+                  <input
+                    type="number"
+                    step="0.1"
+                    value={editActivationPct}
+                    onChange={(e) => setEditActivationPct(parseFloat(e.target.value) || 0.8)}
+                    className="w-full mt-1 px-2 py-1.5 text-sm bg-[var(--background)] border border-[var(--border)] rounded-md focus:outline-none focus:ring-1 focus:ring-[var(--primary)]"
+                  />
+                  <p className="text-[10px] text-[var(--muted-foreground)] mt-0.5">of margin</p>
+                </div>
+                <div>
+                  <label className="text-xs text-[var(--muted-foreground)]">Step %</label>
+                  <input
+                    type="number"
+                    step="0.05"
+                    value={editStepPct}
+                    onChange={(e) => setEditStepPct(parseFloat(e.target.value) || 0.1)}
+                    className="w-full mt-1 px-2 py-1.5 text-sm bg-[var(--background)] border border-[var(--border)] rounded-md focus:outline-none focus:ring-1 focus:ring-[var(--primary)]"
+                  />
+                  <p className="text-[10px] text-[var(--muted-foreground)] mt-0.5">P&L increase</p>
+                </div>
+                <div>
+                  <label className="text-xs text-[var(--muted-foreground)]">Lock %</label>
+                  <input
+                    type="number"
+                    step="0.01"
+                    value={editLockPct}
+                    onChange={(e) => setEditLockPct(parseFloat(e.target.value) || 0.05)}
+                    className="w-full mt-1 px-2 py-1.5 text-sm bg-[var(--background)] border border-[var(--border)] rounded-md focus:outline-none focus:ring-1 focus:ring-[var(--primary)]"
+                  />
+                  <p className="text-[10px] text-[var(--muted-foreground)] mt-0.5">per step</p>
+                </div>
+              </div>
+              
+              <p className="text-xs text-[var(--muted-foreground)] bg-[var(--muted)] p-2 rounded">
+                When P&L ≥ {editActivationPct}% of margin, lock in profits. 
+                Every {editStepPct}% increase raises floor by {editLockPct}%.
+              </p>
+              
+              <div className="flex gap-2 justify-end">
+                <Button variant="outline" onClick={() => setEditingTrailingStop(null)}>
+                  Cancel
+                </Button>
+                <Button onClick={handleSaveTrailingStopConfig} disabled={savingConfig}>
+                  {savingConfig ? 'Saving...' : 'Save'}
+                </Button>
+              </div>
+            </CardContent>
+          </Card>
+        </div>
+      )}
     </div>
   );
 }

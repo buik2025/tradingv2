@@ -1,13 +1,18 @@
-"""Backtesting and simulation module"""
+"""Backtesting and simulation module
 
-from .strategy_backtester import StrategyBacktester, BacktestMode, BacktestResult
+Backtesting uses the production Orchestrator with HistoricalDataClient
+injecting historical data instead of live data.
+
+Components:
+- HistoricalDataClient: KiteClient replacement for historical data
+- OptionsSimulator: Black-Scholes pricing for synthetic options
+"""
+
 from .options_simulator import OptionsSimulator
-from .backtest_engine import BacktestEngine
+from .historical_data_client import HistoricalDataClient, load_ohlcv_data
 
 __all__ = [
-    "StrategyBacktester",
-    "BacktestMode",
-    "BacktestResult",
     "OptionsSimulator",
-    "BacktestEngine",
+    "HistoricalDataClient",
+    "load_ohlcv_data",
 ]

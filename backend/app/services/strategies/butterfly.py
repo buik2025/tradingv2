@@ -33,9 +33,16 @@ class ButterflyStrategy:
     - Neutral RSI
     """
     
-    def __init__(self, lot_size: int = 50):
+    def __init__(self, lot_size: int = 50, kite=None):
         self.lot_size = lot_size
+        self.kite = kite
         self.name = "IRON_BUTTERFLY"
+    
+    def _get_lot_size(self, symbol: str) -> int:
+        """Get lot size from Kite API or use default."""
+        if self.kite and hasattr(self.kite, 'get_lot_size'):
+            return self.kite.get_lot_size(symbol)
+        return self.lot_size
     
     def check_entry_conditions(self, regime: RegimePacket) -> Tuple[bool, str]:
         """Check if entry conditions are met for butterfly."""
@@ -99,7 +106,7 @@ class ButterflyStrategy:
         atm_strike, lower_wing, upper_wing = strikes
         
         # Build legs
-        legs = self._build_legs(option_chain, strikes, expiry)
+        legs = self._build_legs(option_chain, strikes, expiry, symbol=regime.symbol)
         if len(legs) != 4:
             return None
         
@@ -111,11 +118,12 @@ class ButterflyStrategy:
         net_credit = short_credit - long_debit
         
         # Max profit = net credit (if price pins at ATM)
-        max_profit = net_credit * self.lot_size
+        lot_size = self._get_lot_size(regime.symbol)
+        max_profit = net_credit * lot_size
         
         # Max loss = wing width - net credit
         wing_width = upper_wing - atm_strike
-        max_loss = (wing_width - net_credit) * self.lot_size
+        max_loss = (wing_width - net_credit) * lot_size
         
         target_pnl = max_profit * 0.40  # 40% of max profit (conservative)
         stop_loss = -max_loss * 0.50    # 50% of max loss
@@ -182,7 +190,8 @@ class ButterflyStrategy:
         self,
         option_chain: pd.DataFrame,
         strikes: Tuple[float, float, float],
-        expiry: date
+        expiry: date,
+        symbol: str = "NIFTY"
     ) -> List[TradeLeg]:
         """Build the four legs of Iron Butterfly."""
         atm_strike, lower_wing, upper_wing = strikes
@@ -214,7 +223,7 @@ class ButterflyStrategy:
                 strike=strike,
                 expiry=expiry,
                 option_type=opt_type,
-                quantity=self.lot_size,
+                quantity=self._get_lot_size(symbol),
                 entry_price=float(opt.get('ltp', 0)),
                 delta=float(opt.get('delta', 0)),
                 gamma=float(opt.get('gamma', 0)),
@@ -255,9 +264,16 @@ class BrokenWingButterflyStrategy:
     - RSI extreme (oversold for bullish BWB, overbought for bearish)
     """
     
-    def __init__(self, lot_size: int = 50):
+    def __init__(self, lot_size: int = 50, kite=None):
         self.lot_size = lot_size
+        self.kite = kite
         self.name = "BROKEN_WING_BUTTERFLY"
+    
+    def _get_lot_size(self, symbol: str) -> int:
+        """Get lot size from Kite API or use default."""
+        if self.kite and hasattr(self.kite, 'get_lot_size'):
+            return self.kite.get_lot_size(symbol)
+        return self.lot_size
     
     def check_entry_conditions(self, regime: RegimePacket) -> Tuple[bool, str]:
         """Check if entry conditions are met."""
@@ -313,7 +329,7 @@ class BrokenWingButterflyStrategy:
         body_strike, short_strike, broken_wing = strikes
         
         # Build legs
-        legs = self._build_legs(option_chain, strikes, expiry, is_bullish)
+        legs = self._build_legs(option_chain, strikes, expiry, is_bullish, symbol=regime.symbol)
         if len(legs) != 4:  # 1 + 2 + 1
             return None
         
@@ -324,8 +340,9 @@ class BrokenWingButterflyStrategy:
         )
         
         # Max profit is at short strike
-        max_profit = abs(body_strike - short_strike) * self.lot_size - abs(net_premium) * self.lot_size
-        max_loss = abs(short_strike - broken_wing) * self.lot_size
+        lot_size = self._get_lot_size(regime.symbol)
+        max_profit = abs(body_strike - short_strike) * lot_size - abs(net_premium) * lot_size
+        max_loss = abs(short_strike - broken_wing) * lot_size
         
         target_pnl = max_profit * 0.50
         stop_loss = -max_loss * 0.40
@@ -398,7 +415,8 @@ class BrokenWingButterflyStrategy:
         option_chain: pd.DataFrame,
         strikes: Tuple[float, float, float],
         expiry: date,
-        is_bullish: bool
+        is_bullish: bool,
+        symbol: str = "NIFTY"
     ) -> List[TradeLeg]:
         """Build BWB legs."""
         body_strike, short_strike, broken_wing = strikes
@@ -430,7 +448,7 @@ class BrokenWingButterflyStrategy:
                 strike=strike,
                 expiry=expiry,
                 option_type=opt_type,
-                quantity=self.lot_size * qty_mult,
+                quantity=self._get_lot_size(symbol) * qty_mult,
                 entry_price=float(opt.get('ltp', 0)),
                 delta=float(opt.get('delta', 0)),
                 gamma=float(opt.get('gamma', 0)),

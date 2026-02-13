@@ -56,6 +56,7 @@ export interface Regime {
     adx: number;
     rsi: number;
     iv_percentile: number;
+    india_vix?: number;
     realized_vol?: number;
     atr?: number;
   };

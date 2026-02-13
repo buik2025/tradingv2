@@ -4,9 +4,10 @@ Circuit Breaker and Risk Management Module - Section 6 of v2_rulebook.
 Implements loss limits and drawdown tracking:
 - Daily loss: -1.5% equity → flatten/rest day
 - Weekly loss: -4% equity → flat 3 days
-- Monthly loss: -10% equity → flat 1 week + review
+- Monthly loss: -8% equity → flat 1 week + review (v2.5: tightened from -10%)
 - Consecutive losses: 3 losers → flat 1 day + 50% size reduction
 - ML probability: loss >0.6 → preemptive flatten
+- v2.5: Chaos flat 48hr after DC abnormal > 2 days
 """
 
 from datetime import datetime, timedelta
@@ -25,6 +26,7 @@ class CircuitBreakerState(str, Enum):
     WEEKLY_HALT = "weekly_halt"
     MONTHLY_HALT = "monthly_halt"
     PREEMPTIVE_HALT = "preemptive_halt"
+    CHAOS_HALT = "chaos_halt"  # v2.5: DC abnormal > 2 days
 
 
 class CircuitBreakerMetrics(BaseModel):
@@ -67,17 +69,18 @@ class CircuitBreakerMetrics(BaseModel):
 class CircuitBreaker:
     """Monitors and enforces loss limits."""
     
-    # Thresholds from v2_rulebook Section 6
+    # Thresholds from v2_rulebook Section 6 (v2.5 updates)
     DAILY_LOSS_LIMIT = 0.015  # -1.5%
     WEEKLY_LOSS_LIMIT = 0.04   # -4%
-    MONTHLY_LOSS_LIMIT = 0.10  # -10%
+    MONTHLY_LOSS_LIMIT = 0.08  # -8% (v2.5: tightened from -10%)
     CONSECUTIVE_LOSS_LIMIT = 3  # 3 losers
     ML_LOSS_PROB_THRESHOLD = 0.6  # Preemptive halt
     
     DAILY_HALT_DAYS = 1
     WEEKLY_HALT_DAYS = 3
-    MONTHLY_HALT_DAYS = 7
+    MONTHLY_HALT_DAYS = 7  # v2.5: pause + Monk audit
     CONSECUTIVE_HALT_DAYS = 1
+    CHAOS_HALT_HOURS = 48  # v2.5: flat 48hr after DC abnormal > 2 days
     
     def __init__(self, initial_equity: float = 100000.0):
         """Initialize circuit breaker.
@@ -183,14 +186,40 @@ class CircuitBreaker:
             )
     
     def _check_monthly_limit(self) -> None:
-        """Check if monthly loss limit exceeded."""
+        """Check if monthly loss limit exceeded (v2.5: -8%)."""
         if (self.metrics.monthly_loss_pct <= -self.MONTHLY_LOSS_LIMIT and
                 self.metrics.halt_state == CircuitBreakerState.ACTIVE):
             self._trigger_halt(
                 CircuitBreakerState.MONTHLY_HALT,
-                f"Monthly loss {self.metrics.monthly_loss_pct:.1%} exceeded -{self.MONTHLY_LOSS_LIMIT:.1%}",
+                f"Monthly loss {self.metrics.monthly_loss_pct:.1%} exceeded -{self.MONTHLY_LOSS_LIMIT:.1%} (v2.5: requires Monk audit)",
                 self.MONTHLY_HALT_DAYS
             )
+    
+    def trigger_chaos_halt(self, sustained_days: int) -> CircuitBreakerState:
+        """
+        v2.5: Trigger chaos halt after DC abnormal > 2 consecutive days.
+        
+        Args:
+            sustained_days: Number of consecutive chaos trigger days
+            
+        Returns:
+            New circuit breaker state
+        """
+        if sustained_days >= 2 and self.metrics.halt_state == CircuitBreakerState.ACTIVE:
+            # Calculate hours for halt
+            halt_hours = self.CHAOS_HALT_HOURS
+            halt_until = datetime.now() + timedelta(hours=halt_hours)
+            
+            self.metrics.halt_state = CircuitBreakerState.CHAOS_HALT
+            self.metrics.halt_reason = f"v2.5: DC abnormal for {sustained_days} consecutive days - flat {halt_hours}hr"
+            self.metrics.halt_until = halt_until
+            
+            logger.warning(
+                f"🛑 v2.5 CHAOS HALT: {sustained_days} consecutive chaos days | "
+                f"Flat until: {halt_until}"
+            )
+        
+        return self.metrics.halt_state
     
     def _trigger_halt(self, state: CircuitBreakerState, reason: str, days: int) -> None:
         """Trigger circuit breaker halt.

@@ -111,9 +111,14 @@ export function RegimeCard({ regime }: RegimeCardProps) {
             )}
           </div>
           <div>
-            <p className="text-xs text-[var(--muted-foreground)]">IV %ile</p>
+            <p className="text-xs text-[var(--muted-foreground)]">IV Rank</p>
             <p className="font-medium">{regime.metrics.iv_percentile.toFixed(0)}%</p>
-            {regime.thresholds && (
+            {regime.metrics.india_vix && (
+              <p className="text-[10px] text-[var(--muted-foreground)]">
+                VIX: {regime.metrics.india_vix.toFixed(1)}
+              </p>
+            )}
+            {!regime.metrics.india_vix && regime.thresholds && (
               <p className="text-[10px] text-[var(--muted-foreground)]">
                 &gt;{regime.thresholds.iv_high}% = chaos
               </p>

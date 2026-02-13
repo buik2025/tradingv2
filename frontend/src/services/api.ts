@@ -113,6 +113,13 @@ export const ordersApi = {
 };
 
 // Strategies
+export interface TrailingStopConfigInput {
+  enabled: boolean;
+  activation_pct: number;
+  step_pct: number;
+  lock_pct: number;
+}
+
 export interface CreateStrategyRequest {
   name: string;
   label?: string;
@@ -120,6 +127,7 @@ export interface CreateStrategyRequest {
   portfolio_id?: string;
   notes?: string;
   tags?: string[];
+  trailing_stop?: TrailingStopConfigInput;
 }
 
 export interface CreateStrategyResponse {
@@ -127,6 +135,43 @@ export interface CreateStrategyResponse {
   name: string;
   positions_count: number;
   message: string;
+}
+
+// Trailing Stop Types
+export interface TrailingStopConfig {
+  activation_pct: number;
+  step_pct: number;
+  lock_pct: number;
+}
+
+export interface TrailingStopState {
+  is_active: boolean;
+  margin_used: number | null;
+  current_pnl: number | null;
+  current_pnl_pct: number | null;
+  floor_pct: number | null;
+  high_water_pct: number | null;
+  activated_at: string | null;
+  sl_order_ids: string[];
+}
+
+export interface TrailingStopStatus {
+  strategy_id: string;
+  strategy_name: string;
+  enabled: boolean;
+  config: TrailingStopConfig;
+  state: TrailingStopState;
+}
+
+export interface TrailingStopSummary {
+  strategy_id: string;
+  strategy_name: string;
+  status: string;
+  is_active: boolean;
+  current_pnl_pct: number | null;
+  floor_pct: number | null;
+  high_water_pct: number | null;
+  sl_order_count: number;
 }
 
 export const strategiesApi = {
@@ -142,6 +187,23 @@ export const strategiesApi = {
     api.put(`/strategies/${id}/positions`, data),
   close: (id: string, reason?: string) =>
     api.post(`/strategies/${id}/close`, null, { params: { reason } }),
+  // Trailing Stop endpoints
+  enableTrailingStop: (id: string, config?: TrailingStopConfig) =>
+    api.post(`/strategies/${id}/trailing-stop/enable`, config || {}),
+  disableTrailingStop: (id: string, cancelOrders?: boolean) =>
+    api.post(`/strategies/${id}/trailing-stop/disable`, null, { params: { cancel_orders: cancelOrders ?? true } }),
+  getTrailingStopStatus: (id: string) =>
+    api.get<TrailingStopStatus>(`/strategies/${id}/trailing-stop/status`),
+  updateTrailingStopConfig: (id: string, config: TrailingStopConfig) =>
+    api.put(`/strategies/${id}/trailing-stop/config`, config),
+};
+
+// Trailing Stop Monitor API
+export const trailingStopApi = {
+  getAll: () => api.get<{ strategies: TrailingStopSummary[] }>('/trailing-stop/all'),
+  start: (pollInterval?: number) => 
+    api.post('/trailing-stop/start', null, { params: { poll_interval: pollInterval || 5 } }),
+  stop: () => api.post('/trailing-stop/stop'),
 };
 
 // Portfolios

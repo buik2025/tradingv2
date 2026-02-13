@@ -56,11 +56,16 @@ class Strategist(BaseAgent):
         # Initialize Greeks calculator
         self._greeks_calculator = GreeksCalculator()
         
-        # Initialize strategy modules
-        self._jade_lizard = JadeLizardStrategy(lot_size=50)
-        self._butterfly = ButterflyStrategy(lot_size=50)
-        self._bwb = BrokenWingButterflyStrategy(lot_size=50)
-        self._bwb = BrokenWingButterflyStrategy(lot_size=50)
+        # Lot size cache (fetched from Kite API)
+        self._lot_size_cache: Dict[str, int] = {}
+        
+        # Margin cache to avoid repeated API calls
+        self._margin_cache: Dict[str, float] = {}
+        
+        # Initialize strategy modules with kite reference for dynamic lot size
+        self._jade_lizard = JadeLizardStrategy(kite=self.kite)
+        self._butterfly = ButterflyStrategy(kite=self.kite)
+        self._bwb = BrokenWingButterflyStrategy(kite=self.kite)
         self._strangle = StrangleStrategy(self.kite)
         self._risk_reversal = RiskReversalStrategy(self.kite)
         
@@ -89,15 +94,19 @@ class Strategist(BaseAgent):
         
         # Check if trading is allowed (can be bypassed for backtesting)
         if not self.bypass_entry_window and not self._is_entry_window():
-            self.logger.debug("Outside entry window")
+            self.logger.info(f"Outside entry window (current: {datetime.now().time()}, window: {ENTRY_START_HOUR}:{ENTRY_START_MINUTE}-{ENTRY_END_HOUR}:{ENTRY_END_MINUTE})")
             return proposals
+        
+        self.logger.info(f"Within entry window, processing regime: {regime_packet.regime.value}")
         
         # Get suitable structures for current regime from unified selector
         suitable_structures = StrategySelector.get_suitable_structures(regime_packet)
         
         if not suitable_structures:
-            self.logger.info(f"{regime_packet.regime} regime - no suitable structures")
+            self.logger.info(f"{regime_packet.regime.value} regime - no suitable structures from StrategySelector")
             return proposals
+        
+        self.logger.info(f"{regime_packet.regime.value} regime - {len(suitable_structures)} suitable structures: {[s[0].value for s in suitable_structures]}")
         
         # Generate proposal for each suitable structure (in priority order)
         for structure, conditions in suitable_structures:
@@ -122,8 +131,10 @@ class Strategist(BaseAgent):
             )
             
             if not should_enter:
-                self.logger.debug(f"Skipping {structure.value}: {reason}")
+                self.logger.info(f"Skipping {structure.value}: {reason}")
                 continue
+            
+            self.logger.info(f"Entry conditions met for {structure.value}, generating proposal...")
             
             # Generate proposal for this structure
             proposal = None
@@ -153,7 +164,9 @@ class Strategist(BaseAgent):
                 self._set_dynamic_targets(proposal, strategy_type)
                 
                 proposals.append(proposal)
-                self.logger.info(f"Generated {structure.value}: {reason}")
+                self.logger.info(f"Generated {structure.value} proposal successfully")
+            else:
+                self.logger.warning(f"Failed to generate proposal for {structure.value} - returned None")
         
         # Limit to best proposal (avoid over-trading)
         if len(proposals) > 1:
@@ -169,12 +182,15 @@ class Strategist(BaseAgent):
         symbol = regime.symbol
         expiry = self._get_target_expiry(symbol, IC_MIN_DTE, IC_MAX_DTE)
         if not expiry:
+            self.logger.warning(f"Jade Lizard: No expiry found for {symbol} with DTE {IC_MIN_DTE}-{IC_MAX_DTE}")
             return None
         
         option_chain = self.kite.get_option_chain(symbol, expiry)
         if option_chain.empty:
+            self.logger.warning(f"Jade Lizard: Empty option chain for {symbol} expiry {expiry}")
             return None
         
+        self.logger.info(f"Jade Lizard: Got {len(option_chain)} options for {symbol} expiry {expiry}")
         return self._jade_lizard.generate_proposal(regime, option_chain, expiry)
     
     def _generate_butterfly(self, regime: RegimePacket) -> Optional[TradeProposal]:
@@ -231,11 +247,15 @@ class Strategist(BaseAgent):
         # Directional plays usually target 30-45 DTE
         expiry = self._get_target_expiry(symbol, 25, 45)
         if not expiry:
+            self.logger.warning(f"Risk Reversal: No expiry found for {symbol} with DTE 25-45")
             return None
             
         option_chain = self.kite.get_option_chain(symbol, expiry)
         if option_chain.empty:
+            self.logger.warning(f"Risk Reversal: Empty option chain for {symbol} expiry {expiry}")
             return None
+        
+        self.logger.info(f"Risk Reversal: Got {len(option_chain)} options for {symbol} expiry {expiry}")
             
         proposal = self._risk_reversal.generate_proposal(regime, option_chain, expiry)
         if not proposal:
@@ -286,6 +306,24 @@ class Strategist(BaseAgent):
         start = time(ENTRY_START_HOUR, ENTRY_START_MINUTE)
         end = time(ENTRY_END_HOUR, ENTRY_END_MINUTE)
         return start <= now <= end
+    
+    def _get_lot_size(self, symbol: str) -> int:
+        """
+        Get lot size for a symbol from Kite API (cached).
+        
+        Args:
+            symbol: Underlying symbol (NIFTY, BANKNIFTY, etc.)
+            
+        Returns:
+            Lot size for the symbol
+        """
+        if symbol in self._lot_size_cache:
+            return self._lot_size_cache[symbol]
+        
+        lot_size = self.kite.get_lot_size(symbol)
+        self._lot_size_cache[symbol] = lot_size
+        self.logger.info(f"Lot size for {symbol}: {lot_size}")
+        return lot_size
 
     def _generate_iron_condor(self, regime: RegimePacket) -> Optional[TradeProposal]:
         """
@@ -329,7 +367,7 @@ class Strategist(BaseAgent):
         short_call_strike, short_put_strike, long_call_strike, long_put_strike = strikes
         
         # Build legs
-        legs = self._build_ic_legs(option_chain, strikes, expiry)
+        legs = self._build_ic_legs(option_chain, strikes, expiry, symbol=symbol)
         if not legs or len(legs) != 4:
             self.logger.warning("Could not build all legs")
             return None
@@ -363,8 +401,12 @@ class Strategist(BaseAgent):
             "vega": sum(leg.vega * (1 if leg.is_long else -1) for leg in legs)
         }
         
-        # Estimate margin (simplified - actual margin from broker)
-        required_margin = wing_width * 50  # Lot size * wing width as rough estimate
+        # Get actual margin from Kite API
+        required_margin = self._calculate_margin_from_api(legs, lot_size=65)
+        if required_margin == 0:
+            # Fallback estimation if API fails
+            required_margin = wing_width * 65  # Lot size * wing width as rough estimate
+            self.logger.warning(f"Using fallback margin estimate: ₹{required_margin:,.0f}")
         
         days_to_expiry = (expiry - date.today()).days
         
@@ -432,9 +474,10 @@ class Strategist(BaseAgent):
         max_dte: int
     ) -> Optional[date]:
         """Get expiry date within target DTE range."""
-        # Get available expiries from instruments
+        # Get available expiries from instruments API
         instruments = self.kite.get_instruments(NFO)
         if instruments.empty:
+            self.logger.warning(f"Empty instruments list from Kite API for {NFO}")
             return None
         
         # Filter for symbol options
@@ -444,24 +487,32 @@ class Strategist(BaseAgent):
         ]
         
         if options.empty:
+            self.logger.warning(f"No options found for {symbol} in instruments")
             return None
         
-        # Get unique expiries
+        # Get unique expiries from API data
         expiries = pd.to_datetime(options['expiry'].unique()).date
         today = date.today()
         
+        # Log available expiries for debugging
+        sorted_expiries = sorted(expiries)
+        self.logger.info(f"Available expiries for {symbol}: {sorted_expiries[:5]} (showing first 5)")
+        
         # Find expiry in target range
-        for exp in sorted(expiries):
+        for exp in sorted_expiries:
             dte = (exp - today).days
             if min_dte <= dte <= max_dte:
+                self.logger.info(f"Selected expiry {exp} (DTE={dte}) for {symbol}")
                 return exp
         
-        # If no exact match, find closest
-        for exp in sorted(expiries):
+        # If no exact match, find closest with DTE >= min_dte
+        for exp in sorted_expiries:
             dte = (exp - today).days
             if dte >= min_dte:
+                self.logger.info(f"Selected closest expiry {exp} (DTE={dte}) for {symbol}")
                 return exp
         
+        self.logger.warning(f"No suitable expiry found for {symbol} with DTE {min_dte}-{max_dte}")
         return None
     
     def _select_ic_strikes(
@@ -579,7 +630,8 @@ class Strategist(BaseAgent):
         self,
         option_chain: pd.DataFrame,
         strikes: Tuple[float, float, float, float],
-        expiry: date
+        expiry: date,
+        symbol: str = "NIFTY"
     ) -> List[TradeLeg]:
         """Build the four legs of an Iron Condor."""
         short_call_strike, short_put_strike, long_call_strike, long_put_strike = strikes
@@ -593,10 +645,13 @@ class Strategist(BaseAgent):
             # Estimate from ATM strike
             spot_price = (short_call_strike + short_put_strike) / 2
         
+        # Get lot size from Kite API
+        lot_size = self._get_lot_size(symbol)
+        
         # Short Call
         short_call = self._build_leg(
             option_chain, short_call_strike, 'CE', expiry,
-            LegType.SHORT_CALL, quantity=50, spot_price=spot_price  # NIFTY lot size
+            LegType.SHORT_CALL, quantity=lot_size, spot_price=spot_price
         )
         if short_call:
             legs.append(short_call)
@@ -604,7 +659,7 @@ class Strategist(BaseAgent):
         # Short Put
         short_put = self._build_leg(
             option_chain, short_put_strike, 'PE', expiry,
-            LegType.SHORT_PUT, quantity=50, spot_price=spot_price
+            LegType.SHORT_PUT, quantity=lot_size, spot_price=spot_price
         )
         if short_put:
             legs.append(short_put)
@@ -612,7 +667,7 @@ class Strategist(BaseAgent):
         # Long Call
         long_call = self._build_leg(
             option_chain, long_call_strike, 'CE', expiry,
-            LegType.LONG_CALL, quantity=50, spot_price=spot_price
+            LegType.LONG_CALL, quantity=lot_size, spot_price=spot_price
         )
         if long_call:
             legs.append(long_call)
@@ -620,7 +675,7 @@ class Strategist(BaseAgent):
         # Long Put
         long_put = self._build_leg(
             option_chain, long_put_strike, 'PE', expiry,
-            LegType.LONG_PUT, quantity=50, spot_price=spot_price
+            LegType.LONG_PUT, quantity=lot_size, spot_price=spot_price
         )
         if long_put:
             legs.append(long_put)
@@ -762,3 +817,68 @@ class Strategist(BaseAgent):
             f"target={proposal.target_pnl:.0f}, "
             f"trailing={proposal.trailing_mode}"
         )
+    
+    def _calculate_margin_from_api(self, legs: List[TradeLeg], lot_size: int = 75) -> float:
+        """
+        Calculate actual margin required using Kite order_margins API.
+        
+        Args:
+            legs: List of TradeLeg objects
+            lot_size: Lot size for the instrument
+            
+        Returns:
+            Total margin required (float), or 0 if API call fails
+        """
+        if not legs:
+            return 0.0
+        
+        # Build orders list for Kite API
+        orders = []
+        for leg in legs:
+            order = {
+                "exchange": leg.exchange or "NFO",
+                "tradingsymbol": leg.tradingsymbol,
+                "transaction_type": "SELL" if leg.is_short else "BUY",
+                "variety": "regular",
+                "product": "NRML",
+                "order_type": "MARKET",
+                "quantity": leg.quantity or lot_size,
+                "price": 0
+            }
+            orders.append(order)
+        
+        # Create cache key
+        cache_key = "_".join(sorted([o["tradingsymbol"] for o in orders]))
+        if cache_key in self._margin_cache:
+            return self._margin_cache[cache_key]
+        
+        try:
+            # Use basket_margins for combined margin (accounts for hedging)
+            basket = {"orders": orders}
+            margin_result = self.kite.get_basket_margins(basket)
+            
+            if margin_result:
+                # Basket margins returns combined margin with hedging benefit
+                total_margin = margin_result.get("final", {}).get("total", 0)
+                if total_margin == 0:
+                    # Fallback to initial margin
+                    total_margin = margin_result.get("initial", {}).get("total", 0)
+                
+                if total_margin > 0:
+                    self._margin_cache[cache_key] = total_margin
+                    self.logger.info(f"Kite API margin for {len(legs)} legs: ₹{total_margin:,.0f}")
+                    return total_margin
+            
+            # Fallback: use order_margins for individual legs
+            margin_results = self.kite.get_order_margins(orders)
+            if margin_results:
+                total_margin = sum(m.get("total", 0) for m in margin_results)
+                if total_margin > 0:
+                    self._margin_cache[cache_key] = total_margin
+                    self.logger.info(f"Kite API margin (individual): ₹{total_margin:,.0f}")
+                    return total_margin
+                    
+        except Exception as e:
+            self.logger.warning(f"Failed to get margin from Kite API: {e}")
+        
+        return 0.0

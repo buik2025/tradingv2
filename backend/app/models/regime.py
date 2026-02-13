@@ -20,7 +20,8 @@ class RegimeMetrics(BaseModel):
     """Technical metrics used for regime detection."""
     adx: float = Field(..., description="Average Directional Index (14-period)")
     rsi: float = Field(..., description="Relative Strength Index (14-period)")
-    iv_percentile: float = Field(..., description="IV percentile (0-100)")
+    iv_percentile: float = Field(..., description="IV percentile (0-100) based on India VIX")
+    india_vix: Optional[float] = Field(None, description="Current India VIX value")
     realized_vol: float = Field(..., description="Realized volatility")
     atr: float = Field(..., description="Average True Range")
     rv_atr_ratio: float = Field(..., description="RV/ATR ratio")
@@ -102,6 +103,11 @@ class RegimePacket(BaseModel):
     is_safe: bool = Field(True, description="Overall safety flag for trading")
     safety_reasons: List[str] = Field(default_factory=list, description="Reasons if not safe")
     
+    # v2.5: Veto and warning flags
+    veto_shortvol: bool = Field(False, description="v2.5: Veto short-vol trades")
+    warning_state: bool = Field(False, description="v2.5: Warning state (single-day trigger, tighten size)")
+    sustained_chaos_days: int = Field(0, description="v2.5: Consecutive days of chaos triggers")
+    
     # NEW: Confluence scoring
     confluence: Optional[ConfluenceScore] = Field(None, description="Confluence scoring details")
     
@@ -124,19 +130,21 @@ class RegimePacket(BaseModel):
         return self.regime == RegimeType.CAUTION
     
     def allows_short_vol(self) -> bool:
-        """Check if conditions allow short volatility trades."""
+        """Check if conditions allow short volatility trades (v2.5: check veto)."""
         return (
             self.is_range_bound() and
             not self.event_flag and
+            not self.veto_shortvol and
             self.metrics.iv_percentile >= 40 and
             self.metrics.iv_percentile < 75
         )
     
     def allows_hedged_short_vol(self) -> bool:
-        """Check if conditions allow hedged short-vol (iron condors, jade lizards)."""
+        """Check if conditions allow hedged short-vol (iron condors, jade lizards) (v2.5: check veto)."""
         return (
             (self.is_range_bound() or self.is_caution()) and
             not self.event_flag and
+            not self.veto_shortvol and
             self.metrics.iv_percentile < 75
         )
     

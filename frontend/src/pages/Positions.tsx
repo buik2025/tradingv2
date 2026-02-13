@@ -50,6 +50,7 @@ export function Positions() {
   const [newStrategyName, setNewStrategyName] = useState('');
   const [newStrategyLabel, setNewStrategyLabel] = useState('');
   const [creatingStrategy, setCreatingStrategy] = useState(false);
+  const [createError, setCreateError] = useState<string | null>(null);
 
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
@@ -227,31 +228,48 @@ export function Positions() {
 
   // Create strategy from selected positions
   const handleCreateStrategy = async () => {
-    if (selectedPositions.size === 0) return;
+    if (selectedPositions.size === 0) {
+      setCreateError('No positions selected');
+      return;
+    }
     
-    const name = newStrategyName || generateDefaultStrategyName();
-    if (!name) return;
+    const name = newStrategyName.trim();
+    if (!name) {
+      setCreateError('Strategy name is required');
+      return;
+    }
     
     setCreatingStrategy(true);
+    setCreateError(null);
+    
     try {
-      await strategiesApi.create({
+      const response = await strategiesApi.create({
         name,
         label: newStrategyLabel || undefined,
         position_ids: [...selectedPositions],
       });
+      
+      console.log('Strategy created:', response.data);
       
       // Reset state
       setSelectedPositions(new Set());
       setShowCreateStrategy(false);
       setNewStrategyName('');
       setNewStrategyLabel('');
+      setCreateError(null);
       
       // Refresh strategies if in strategy view
       if (viewMode === 'strategies') {
         fetchStrategies();
       }
-    } catch (error) {
+      
+      // Switch to strategies view to show the new strategy
+      setViewMode('strategies');
+      fetchStrategies();
+    } catch (error: any) {
       console.error('Failed to create strategy:', error);
+      const errorMsg = error.response?.data?.detail || error.message || 'Failed to create strategy';
+      setCreateError(errorMsg);
     } finally {
       setCreatingStrategy(false);
     }
@@ -260,6 +278,7 @@ export function Positions() {
   // Open create strategy modal with default name
   const openCreateStrategyModal = () => {
     setNewStrategyName(generateDefaultStrategyName());
+    setCreateError(null);
     setShowCreateStrategy(true);
   };
 
@@ -724,6 +743,11 @@ export function Positions() {
                 <Check className="h-4 w-4 inline mr-1" />
                 {selectedPositions.size} position{selectedPositions.size !== 1 ? 's' : ''} selected
               </div>
+              {createError && (
+                <div className="text-sm text-[var(--loss)] bg-[var(--loss)]/10 px-3 py-2 rounded">
+                  {createError}
+                </div>
+              )}
               <div className="flex justify-end gap-2 pt-2">
                 <Button 
                   variant="outline" 

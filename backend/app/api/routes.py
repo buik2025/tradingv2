@@ -7,6 +7,8 @@ from datetime import date, datetime
 from pathlib import Path
 from loguru import logger
 
+from ..core.kite_provider import get_kite_client
+
 router = APIRouter()
 
 
@@ -16,22 +18,6 @@ class DataDownloadRequest(BaseModel):
     symbol: str = "NIFTY"
     days: int = 90
     interval: str = "day"
-
-
-class BacktestRequest(BaseModel):
-    data_file: str
-    strategy: str = "iron_condor"
-    initial_capital: float = 1000000
-    position_size_pct: float = 0.02
-
-
-class BacktestResponse(BaseModel):
-    total_trades: int
-    total_return_pct: float
-    sharpe_ratio: float
-    max_drawdown: float
-    win_rate: float
-    profit_factor: float
 
 
 class TradingStatusResponse(BaseModel):
@@ -92,16 +78,14 @@ async def download_data(request: DataDownloadRequest, background_tasks: Backgrou
 
 async def _download_data_task(symbol: str, token: int, days: int, interval: str):
     """Background task to download data."""
-    from ..core.kite_client import KiteClient
     from ..config.settings import Settings
     from datetime import timedelta
     
     config = Settings()
-    kite = KiteClient(
-        api_key=config.kite_api_key,
-        access_token=config.kite_access_token,
-        paper_mode=False
-    )
+    kite = get_kite_client(paper_mode=False, skip_api_check=True)
+    if not kite:
+        logger.error("Cannot download data - no valid KiteClient")
+        return
     
     to_date = date.today()
     from_date = to_date - timedelta(days=days)
@@ -130,65 +114,109 @@ async def list_data_files():
     return {"files": files}
 
 
-# ============== Backtest ==============
+class HistoricalDownloadRequest(BaseModel):
+    symbol: str = "INDIAVIX"
+    years: int = 10
+    interval: str = "day"
 
-@router.post("/backtest/run", response_model=BacktestResponse)
-async def run_backtest(request: BacktestRequest):
-    """Run backtest on historical data."""
-    from ..services.engine import BacktestEngine, BacktestConfig
-    from ..services.data_loader import DataLoader
-    from ..services.technical import calculate_rsi
+
+@router.post("/data/download-historical")
+async def download_historical_data(request: HistoricalDownloadRequest):
+    """Download historical data using session credentials."""
+    from ..api.auth import get_any_valid_access_token, _sessions
+    from ..config.settings import Settings
+    from ..config.constants import NIFTY_TOKEN, BANKNIFTY_TOKEN, INDIA_VIX_TOKEN
+    from kiteconnect import KiteConnect
+    from datetime import timedelta
+    import pandas as pd
     
-    data_path = Path("data") / request.data_file
-    if not data_path.exists():
-        raise HTTPException(status_code=404, detail=f"Data file not found: {request.data_file}")
+    # Get valid access token from in-memory session first
+    access_token = None
+    for session_id, session_data in _sessions.items():
+        token = session_data.get("access_token")
+        if token:
+            access_token = token
+            break
     
-    # Load data
-    loader = DataLoader()
-    data = loader.load_from_csv(data_path)
+    # Fallback to get_any_valid_access_token
+    if not access_token:
+        access_token = get_any_valid_access_token()
     
-    if data.empty:
-        raise HTTPException(status_code=400, detail="No data in file")
+    if not access_token:
+        raise HTTPException(status_code=401, detail="No valid session. Please login via the web UI first.")
     
-    # Configure backtest
-    bt_config = BacktestConfig(
-        initial_capital=request.initial_capital,
-        position_size_pct=request.position_size_pct,
-        max_positions=3
-    )
+    config = Settings()
     
-    # Simple entry/exit signals
-    def entry_signal(data, idx):
-        if idx < 20:
-            return None
-        rsi = calculate_rsi(data['close'].iloc[:idx+1], 14)
-        if rsi.iloc[-1] < 30:
-            return {
-                "direction": 1,
-                "stop_loss": data.iloc[idx]['close'] * 0.98,
-                "take_profit": data.iloc[idx]['close'] * 1.02
-            }
-        return None
+    tokens = {
+        "NIFTY": NIFTY_TOKEN,
+        "BANKNIFTY": BANKNIFTY_TOKEN,
+        "INDIAVIX": INDIA_VIX_TOKEN,
+        "VIX": INDIA_VIX_TOKEN
+    }
     
-    def exit_signal(data, idx, position):
-        if idx - position.metadata.get("entry_idx", 0) >= 5:
-            return "TIME_EXIT"
-        return None
+    token = tokens.get(request.symbol.upper())
+    if not token:
+        raise HTTPException(status_code=400, detail=f"Unknown symbol: {request.symbol}. Valid: {list(tokens.keys())}")
     
-    # Run backtest
-    engine = BacktestEngine(bt_config, loader)
-    results = engine.run(data, entry_signal, exit_signal)
+    # Initialize Kite with session token
+    kite = KiteConnect(api_key=config.kite_api_key)
+    kite.set_access_token(access_token)
     
-    metrics = results["metrics"]
+    # Download data in chunks (Kite limits to 2000 candles per request for day interval)
+    to_date = datetime.now()
+    from_date = to_date - timedelta(days=365 * request.years)
     
-    return BacktestResponse(
-        total_trades=metrics.get("num_trades", 0),
-        total_return_pct=metrics.get("total_return_pct", 0),
-        sharpe_ratio=metrics.get("sharpe_ratio", 0),
-        max_drawdown=metrics.get("max_drawdown", 0),
-        win_rate=metrics.get("win_rate", 0),
-        profit_factor=metrics.get("profit_factor", 0)
-    )
+    all_data = []
+    current_to = to_date
+    chunk_days = 365  # 1 year chunks for daily data
+    
+    logger.info(f"Downloading {request.symbol} from {from_date.date()} to {to_date.date()}")
+    
+    while current_to > from_date:
+        current_from = max(from_date, current_to - timedelta(days=chunk_days))
+        
+        try:
+            data = kite.historical_data(
+                instrument_token=token,
+                from_date=current_from,
+                to_date=current_to,
+                interval=request.interval
+            )
+            if data:
+                all_data.extend(data)
+                logger.info(f"  Got {len(data)} records for {current_from.date()} to {current_to.date()}")
+        except Exception as e:
+            logger.warning(f"  Error fetching {current_from.date()} to {current_to.date()}: {e}")
+        
+        current_to = current_from - timedelta(days=1)
+    
+    if not all_data:
+        raise HTTPException(status_code=404, detail=f"No data found for {request.symbol}")
+    
+    # Convert to DataFrame and save
+    df = pd.DataFrame(all_data)
+    df = df.drop_duplicates(subset=['date']).sort_values('date')
+    
+    output_dir = Path("data/breeze/indices")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    csv_path = output_dir / f"{request.symbol.upper()}_daily.csv"
+    parquet_path = output_dir / f"{request.symbol.upper()}_daily.parquet"
+    
+    df.to_csv(csv_path, index=False)
+    df.to_parquet(parquet_path, index=False)
+    
+    logger.info(f"Saved {len(df)} records to {csv_path}")
+    
+    return {
+        "message": f"Downloaded {request.symbol} data",
+        "records": len(df),
+        "date_range": {
+            "start": str(df['date'].min()),
+            "end": str(df['date'].max())
+        },
+        "files": [str(csv_path), str(parquet_path)]
+    }
 
 
 # ============== Trading ==============
@@ -266,12 +294,17 @@ async def get_trading_status():
             regime=None
         )
     
+    # Get last regime from orchestrator
+    regime_str = None
+    if _orchestrator.last_regime:
+        regime_str = f"{_orchestrator.last_regime.regime.value} (safe={_orchestrator.last_regime.is_safe})"
+    
     return TradingStatusResponse(
         mode=_orchestrator.mode,
         running=is_running,
         positions=len(_orchestrator.executor.get_open_positions()) if is_running else 0,
         daily_pnl=_orchestrator.state_manager.get("daily_pnl", 0.0) if is_running else 0,
-        regime=None  # Would need to track last regime
+        regime=regime_str
     )
 
 
@@ -304,12 +337,15 @@ async def get_positions(request: Request):
     if not access_token:
         return []
     
-    kite = KiteClient(
-        api_key=config.kite_api_key,
-        access_token=access_token,
-        paper_mode=False,  # Get real positions
-        mock_mode=False
-    )
+    # Use KiteClientProvider for consistent client management
+    kite = get_kite_client(paper_mode=False)
+    if not kite:
+        kite = KiteClient(
+            api_key=config.kite_api_key,
+            access_token=access_token,
+            paper_mode=False,
+            mock_mode=False
+        )
     
     try:
         # Fetch real positions from Kite
@@ -322,11 +358,19 @@ async def get_positions(request: Request):
         if _orchestrator and _orchestrator.running:
             paper_positions = [p.tradingsymbol for p in _orchestrator.executor.get_open_positions()]
         
+        # F&O exchanges only - filter out equity (NSE/BSE CNC positions)
+        FO_EXCHANGES = {"NFO", "MCX", "BFO", "CDS"}
+        
         result = []
         for p in net_positions:
             qty = p.get("quantity", 0)
             if qty == 0:
                 continue  # Skip closed positions
+            
+            # Filter to F&O only - skip equity positions
+            exchange = p.get("exchange", "")
+            if exchange not in FO_EXCHANGES:
+                continue
                 
             avg_price = p.get("average_price", 0)
             last_price = p.get("last_price", 0)
@@ -381,12 +425,9 @@ async def get_orders(request: Request):
     if not access_token:
         return []
     
-    kite = KiteClient(
-        api_key=config.kite_api_key,
-        access_token=access_token,
-        paper_mode=False,
-        mock_mode=False
-    )
+    kite = get_kite_client(paper_mode=False, skip_api_check=True)
+    if not kite:
+        return []
     
     try:
         orders = kite.get_orders()
@@ -457,12 +498,9 @@ async def get_indices_quotes(request: Request, body: IndicesQuotesRequest):
         logger.warning("No access token or symbols provided")
         return {"quotes": []}
     
-    kite = KiteClient(
-        api_key=config.kite_api_key,
-        access_token=access_token,
-        paper_mode=False,
-        mock_mode=False
-    )
+    kite = get_kite_client(paper_mode=False, skip_api_check=True)
+    if not kite:
+        return {"quotes": []}
     
     try:
         quotes = kite.get_quote(body.symbols)
@@ -481,10 +519,12 @@ async def get_indices_quotes(request: Request, body: IndicesQuotesRequest):
                 change = last_price - prev_close
                 change_pct = (change / prev_close * 100) if prev_close else 0
                 
-                # Check if market is open by looking at last_trade_time
-                # If last trade was within 5 minutes, market is likely open
+                # Check if market is open
+                # For indices, last_trade_time is often null, so use market hours
                 last_trade_time = data.get("last_trade_time")
                 market_open = False
+                
+                # First try last_trade_time if available
                 if last_trade_time:
                     if isinstance(last_trade_time, datetime):
                         ltt = last_trade_time
@@ -495,11 +535,17 @@ async def get_indices_quotes(request: Request, body: IndicesQuotesRequest):
                             ltt = None
                     
                     if ltt:
-                        # Make timezone aware if not already
                         if ltt.tzinfo is None:
                             ltt = ist.localize(ltt)
-                        # Market is open if last trade was within 5 minutes
                         market_open = (now - ltt) < timedelta(minutes=5)
+                
+                # Fallback: check if within NSE market hours (9:15 AM - 3:30 PM IST, Mon-Fri)
+                if not market_open and not last_trade_time:
+                    weekday = now.weekday()  # 0=Monday, 6=Sunday
+                    if weekday < 5:  # Monday to Friday
+                        market_start = now.replace(hour=9, minute=15, second=0, microsecond=0)
+                        market_end = now.replace(hour=15, minute=30, second=0, microsecond=0)
+                        market_open = market_start <= now <= market_end
                 
                 result.append({
                     "symbol": symbol,
@@ -537,12 +583,9 @@ async def get_indices(request: Request):
     if not access_token:
         return {"nifty": None, "sensex": None}
     
-    kite = KiteClient(
-        api_key=config.kite_api_key,
-        access_token=access_token,
-        paper_mode=False,
-        mock_mode=False
-    )
+    kite = get_kite_client(paper_mode=False, skip_api_check=True)
+    if not kite:
+        return {"nifty": None, "sensex": None}
     
     try:
         quotes = kite.get_quote(["NSE:NIFTY 50", "BSE:SENSEX"])
@@ -608,12 +651,15 @@ async def get_account_summary(request: Request):
     if not access_token:
         raise HTTPException(status_code=401, detail="Not authenticated")
     
-    kite = KiteClient(
-        api_key=config.kite_api_key,
-        access_token=access_token,
-        paper_mode=False,
-        mock_mode=False
-    )
+    # Use KiteClientProvider for consistent client management
+    kite = get_kite_client(paper_mode=False)
+    if not kite:
+        kite = KiteClient(
+            api_key=config.kite_api_key,
+            access_token=access_token,
+            paper_mode=False,
+            mock_mode=False
+        )
     
     try:
         margins = kite.get_margins()
@@ -730,12 +776,9 @@ async def get_positions_with_margins(request: Request):
     if not access_token:
         return {"positions": [], "account": {}}
     
-    kite = KiteClient(
-        api_key=config.kite_api_key,
-        access_token=access_token,
-        paper_mode=False,
-        mock_mode=False
-    )
+    kite = get_kite_client(paper_mode=False, skip_api_check=True)
+    if not kite:
+        return {"positions": [], "account": {}}
     
     try:
         # Fetch positions and margins
@@ -1069,6 +1112,14 @@ async def get_strategy_performance(days: int = 30):
 
 # ============== Custom Strategy Management ==============
 
+class TrailingStopConfigInput(BaseModel):
+    """Trailing stop configuration for strategy creation."""
+    enabled: bool = False
+    activation_pct: float = 0.8  # Activate at 0.8% of margin
+    step_pct: float = 0.1  # Step size for P&L increase
+    lock_pct: float = 0.05  # Lock in 0.05% per step
+
+
 class CreateStrategyRequest(BaseModel):
     name: str
     label: Optional[str] = None
@@ -1076,6 +1127,7 @@ class CreateStrategyRequest(BaseModel):
     portfolio_id: Optional[str] = None
     notes: Optional[str] = None
     tags: Optional[List[str]] = None
+    trailing_stop: Optional[TrailingStopConfigInput] = None
 
 
 class UpdateStrategyPositionsRequest(BaseModel):
@@ -1096,8 +1148,8 @@ async def create_strategy(request: CreateStrategyRequest, req: Request):
     from .auth import get_access_token
     from ..core.kite_client import KiteClient
     from ..config.settings import Settings
-    from ..services.instrument_cache import instrument_cache
-    from ..services.pnl_calculator import PnLCalculator
+    from ..services.utilities import InstrumentCache, PnLCalculator
+    instrument_cache = InstrumentCache()
     
     config = Settings()
     
@@ -1105,13 +1157,9 @@ async def create_strategy(request: CreateStrategyRequest, req: Request):
         session = get_session()
         
         # Fetch current positions from Kite to get full details
-        access_token = get_access_token(req) or config.kite_access_token
-        kite = KiteClient(
-            api_key=config.kite_api_key,
-            access_token=access_token,
-            paper_mode=False,
-            mock_mode=False
-        )
+        kite = get_kite_client(paper_mode=False, skip_api_check=True)
+        if not kite:
+            raise HTTPException(status_code=500, detail="No valid KiteClient available")
         positions_data = kite.get_positions()
         net_positions = positions_data.get("net", [])
         
@@ -1127,6 +1175,15 @@ async def create_strategy(request: CreateStrategyRequest, req: Request):
             tags=request.tags,
             status="OPEN"
         )
+        
+        # Apply trailing stop config if provided
+        if request.trailing_stop:
+            from decimal import Decimal
+            strategy.trailing_stop_enabled = request.trailing_stop.enabled
+            strategy.trailing_activation_pct = Decimal(str(request.trailing_stop.activation_pct))
+            strategy.trailing_step_pct = Decimal(str(request.trailing_stop.step_pct))
+            strategy.trailing_lock_pct = Decimal(str(request.trailing_stop.lock_pct))
+        
         session.add(strategy)
         session.flush()
         
@@ -1488,12 +1545,9 @@ async def sync_positions(request: Request):
         raise HTTPException(status_code=401, detail="No access token")
     
     try:
-        kite = KiteClient(
-            api_key=config.kite_api_key,
-            access_token=access_token,
-            paper_mode=False,
-            mock_mode=False
-        )
+        kite = get_kite_client(paper_mode=False, skip_api_check=True)
+        if not kite:
+            raise HTTPException(status_code=500, detail="No valid KiteClient available")
         
         positions_data = kite.get_positions()
         net_positions = positions_data.get("net", [])
@@ -1554,17 +1608,11 @@ async def get_current_regime(request: Request):
     
     config = Settings()
     
-    # Get access token from session
-    access_token = get_access_token(request)
-    if not access_token:
-        # Fall back to config token if no session
-        access_token = config.kite_access_token
+    # Get KiteClient from provider (paper mode for regime detection)
+    kite = get_kite_client(paper_mode=True, skip_api_check=True)
+    if not kite:
+        raise HTTPException(status_code=500, detail="No valid KiteClient available")
     
-    kite = KiteClient(
-        api_key=config.kite_api_key,
-        access_token=access_token,
-        paper_mode=True
-    )
     cache = DataCache(Path("data/cache"))
     
     sentinel = Sentinel(kite, config, cache)
@@ -1581,6 +1629,7 @@ async def get_current_regime(request: Request):
             "adx": regime.metrics.adx,
             "rsi": regime.metrics.rsi,
             "iv_percentile": regime.metrics.iv_percentile,
+            "india_vix": regime.metrics.india_vix,
             "realized_vol": regime.metrics.realized_vol,
             "atr": regime.metrics.atr
         },
@@ -1692,4 +1741,399 @@ def _build_regime_explanation(regime) -> dict:
         "steps": steps,
         "decision": decision,
         "summary": f"Regime: {regime_value} with {regime.regime_confidence*100:.0f}% confidence"
+    }
+
+
+# ============== Trailing Stop Management ==============
+
+class TrailingStopConfigRequest(BaseModel):
+    activation_pct: float = 0.8  # Activate at 0.8% of margin
+    step_pct: float = 0.1  # Step size for P&L increase
+    lock_pct: float = 0.05  # Lock in 0.05% per step
+
+
+@router.post("/strategies/{strategy_id}/trailing-stop/enable")
+async def enable_trailing_stop(strategy_id: str, config: TrailingStopConfigRequest = None):
+    """Enable trailing stop for a strategy.
+    
+    Trailing stop logic:
+    - Monitors strategy P&L as % of margin consumed
+    - When P&L >= activation_pct (default 0.8%): activates trailing
+    - Locks in activation_pct as profit floor
+    - Every step_pct (0.1%) increase in P&L: raises floor by lock_pct (0.05%)
+    - Places SL orders at position level proportionally
+    """
+    from ..services.execution import get_trailing_stop_service
+    
+    if config is None:
+        config = TrailingStopConfigRequest()
+    
+    service = get_trailing_stop_service()
+    success = service.enable_trailing_stop(
+        strategy_id=strategy_id,
+        activation_pct=config.activation_pct,
+        step_pct=config.step_pct,
+        lock_pct=config.lock_pct
+    )
+    
+    if not success:
+        raise HTTPException(status_code=404, detail="Strategy not found or failed to enable")
+    
+    return {
+        "message": "Trailing stop enabled",
+        "strategy_id": strategy_id,
+        "config": {
+            "activation_pct": config.activation_pct,
+            "step_pct": config.step_pct,
+            "lock_pct": config.lock_pct
+        }
+    }
+
+
+@router.post("/strategies/{strategy_id}/trailing-stop/disable")
+async def disable_trailing_stop(strategy_id: str, cancel_orders: bool = True):
+    """Disable trailing stop for a strategy.
+    
+    Args:
+        cancel_orders: If True, cancel any existing SL orders
+    """
+    from ..services.execution import get_trailing_stop_service
+    
+    service = get_trailing_stop_service()
+    success = service.disable_trailing_stop(strategy_id, cancel_orders=cancel_orders)
+    
+    if not success:
+        raise HTTPException(status_code=404, detail="Strategy not found or failed to disable")
+    
+    return {"message": "Trailing stop disabled", "strategy_id": strategy_id}
+
+
+@router.put("/strategies/{strategy_id}/trailing-stop/config")
+async def update_trailing_stop_config(strategy_id: str, config: TrailingStopConfigRequest):
+    """Update trailing stop configuration for a strategy.
+    
+    This updates the config without changing the enabled state.
+    Use enable/disable endpoints to change the enabled state.
+    """
+    from ..database.models import Strategy, get_session
+    from decimal import Decimal
+    
+    session = get_session()
+    try:
+        strategy = session.query(Strategy).filter_by(id=strategy_id).first()
+        if not strategy:
+            raise HTTPException(status_code=404, detail="Strategy not found")
+        
+        strategy.trailing_activation_pct = Decimal(str(config.activation_pct))
+        strategy.trailing_step_pct = Decimal(str(config.step_pct))
+        strategy.trailing_lock_pct = Decimal(str(config.lock_pct))
+        
+        session.commit()
+        
+        return {
+            "message": "Trailing stop config updated",
+            "strategy_id": strategy_id,
+            "config": {
+                "activation_pct": config.activation_pct,
+                "step_pct": config.step_pct,
+                "lock_pct": config.lock_pct
+            }
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        session.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        session.close()
+
+
+@router.get("/strategies/{strategy_id}/trailing-stop/status")
+async def get_trailing_stop_status(strategy_id: str):
+    """Get current trailing stop status for a strategy."""
+    from ..services.execution import get_trailing_stop_service
+    from ..database.models import Strategy, get_session
+    
+    session = get_session()
+    try:
+        strategy = session.query(Strategy).filter_by(id=strategy_id).first()
+        if not strategy:
+            raise HTTPException(status_code=404, detail="Strategy not found")
+        
+        service = get_trailing_stop_service()
+        state = service.get_state(strategy_id)
+        
+        return {
+            "strategy_id": strategy_id,
+            "strategy_name": strategy.name,
+            "enabled": strategy.trailing_stop_enabled or False,
+            "config": {
+                "activation_pct": float(strategy.trailing_activation_pct or 0.8),
+                "step_pct": float(strategy.trailing_step_pct or 0.1),
+                "lock_pct": float(strategy.trailing_lock_pct or 0.05)
+            },
+            "state": {
+                "is_active": state.is_active if state else False,
+                "margin_used": state.margin_used if state else None,
+                "current_pnl": state.current_pnl if state else None,
+                "current_pnl_pct": state.current_pnl_pct if state else None,
+                "floor_pct": state.floor_pct if state else float(strategy.trailing_current_floor_pct) if strategy.trailing_current_floor_pct else None,
+                "high_water_pct": state.high_water_pct if state else float(strategy.trailing_high_water_pct) if strategy.trailing_high_water_pct else None,
+                "activated_at": strategy.trailing_activated_at.isoformat() if strategy.trailing_activated_at else None,
+                "sl_order_ids": strategy.trailing_sl_order_ids or []
+            }
+        }
+    finally:
+        session.close()
+
+
+@router.get("/trailing-stop/all")
+async def get_all_trailing_stop_statuses():
+    """Get trailing stop status for all strategies with it enabled."""
+    from ..services.execution import get_trailing_stop_service
+    from ..database.models import Strategy, get_session
+    
+    session = get_session()
+    try:
+        strategies = session.query(Strategy).filter(
+            Strategy.trailing_stop_enabled == True
+        ).all()
+        
+        service = get_trailing_stop_service()
+        
+        result = []
+        for strategy in strategies:
+            state = service.get_state(strategy.id)
+            result.append({
+                "strategy_id": strategy.id,
+                "strategy_name": strategy.name,
+                "status": strategy.status,
+                "is_active": state.is_active if state else False,
+                "current_pnl_pct": state.current_pnl_pct if state else None,
+                "floor_pct": state.floor_pct if state else float(strategy.trailing_current_floor_pct) if strategy.trailing_current_floor_pct else None,
+                "high_water_pct": state.high_water_pct if state else float(strategy.trailing_high_water_pct) if strategy.trailing_high_water_pct else None,
+                "sl_order_count": len(strategy.trailing_sl_order_ids) if strategy.trailing_sl_order_ids else 0
+            })
+        
+        return {"strategies": result}
+    finally:
+        session.close()
+
+
+@router.post("/trailing-stop/start")
+async def start_trailing_stop_monitor(poll_interval: int = 5, background_tasks: BackgroundTasks = None):
+    """Start the trailing stop monitoring service.
+    
+    This runs in the background and monitors all strategies with trailing stop enabled.
+    """
+    from ..services.execution import get_trailing_stop_service
+    import asyncio
+    
+    service = get_trailing_stop_service()
+    
+    if background_tasks:
+        background_tasks.add_task(service.start, poll_interval)
+        return {"message": f"Trailing stop monitor started with {poll_interval}s interval"}
+    else:
+        # Start in a new task
+        asyncio.create_task(service.start(poll_interval))
+        return {"message": f"Trailing stop monitor started with {poll_interval}s interval"}
+
+
+@router.post("/trailing-stop/stop")
+async def stop_trailing_stop_monitor():
+    """Stop the trailing stop monitoring service."""
+    from ..services.execution import get_trailing_stop_service
+    
+    service = get_trailing_stop_service()
+    service.stop()
+    
+    return {"message": "Trailing stop monitor stopped"}
+
+
+# ============== Reconciliation ==============
+
+@router.post("/reconcile")
+async def reconcile_positions(request: Request, dry_run: bool = False):
+    """Manually trigger position reconciliation.
+    
+    Compares Kite F&O positions with our database and:
+    - Marks closed positions
+    - Updates prices/P&L
+    - Reports discrepancies
+    
+    Args:
+        dry_run: If True, only show what would be done without making changes
+    """
+    from ..services.reconciliation import run_reconciliation
+    from ..config.settings import Settings
+    from .auth import get_access_token
+    
+    config = Settings()
+    access_token = get_access_token(request) or config.kite_access_token
+    
+    if not access_token:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    
+    result = run_reconciliation(
+        api_key=config.kite_api_key,
+        access_token=access_token,
+        dry_run=dry_run
+    )
+    
+    return result
+
+
+@router.get("/debug/strategist")
+async def debug_strategist():
+    """Debug endpoint to test strategist proposal generation and execution."""
+    global _orchestrator
+    from datetime import date
+    
+    if not _orchestrator:
+        raise HTTPException(status_code=400, detail="Trading not running")
+    
+    # Get current regime
+    from ..config.constants import NIFTY_TOKEN
+    regime = _orchestrator.sentinel.process(NIFTY_TOKEN)
+    
+    # Try to generate proposals
+    proposals = _orchestrator.strategist.process(regime)
+    
+    # Get expiry info
+    kite = _orchestrator.kite
+    df = kite.get_instruments("NFO")
+    nifty_opts = df[(df['name'] == 'NIFTY') & (df['instrument_type'].isin(['CE', 'PE']))]
+    expiries = sorted(nifty_opts['expiry'].unique())[:5]
+    
+    # Test Treasury validation for each proposal
+    account = _orchestrator.treasury.get_account_state()
+    treasury_results = []
+    for p in proposals:
+        approved, signal, reason = _orchestrator.treasury.process(p, account)
+        treasury_results.append({
+            "structure": p.structure.value,
+            "approved": approved,
+            "reason": reason,
+            "signal_id": signal.id if signal else None,
+            "legs_with_prices": [
+                {"strike": leg.strike, "entry_price": leg.entry_price, "type": leg.leg_type.value}
+                for leg in (signal.legs if signal else p.legs)
+            ]
+        })
+    
+    return {
+        "regime": regime.regime.value,
+        "is_safe": regime.is_safe,
+        "adx": regime.metrics.adx,
+        "iv_percentile": regime.metrics.iv_percentile,
+        "proposals_count": len(proposals),
+        "proposals": [
+            {
+                "structure": p.structure.value,
+                "instrument": p.instrument,
+                "expiry": str(p.expiry),
+                "legs": len(p.legs),
+                "leg_prices": [leg.entry_price for leg in p.legs]
+            } for p in proposals
+        ],
+        "treasury_validation": treasury_results,
+        "available_expiries": [str(e) for e in expiries],
+        "today": str(date.today())
+    }
+
+
+@router.get("/debug/option-chain/{symbol}/{expiry}")
+async def debug_option_chain(symbol: str, expiry: str):
+    """Debug endpoint to check option chain prices."""
+    global _orchestrator
+    from datetime import date, datetime
+    
+    if not _orchestrator:
+        raise HTTPException(status_code=400, detail="Trading not running")
+    
+    kite = _orchestrator.kite
+    expiry_date = datetime.strptime(expiry, "%Y-%m-%d").date()
+    
+    df = kite.get_option_chain(symbol.upper(), expiry_date)
+    
+    if df.empty:
+        return {"error": "Empty option chain", "symbol": symbol, "expiry": expiry}
+    
+    # Get a sample of options around ATM
+    spot = 25500  # Approximate NIFTY spot
+    sample = df[(df['strike'] >= spot - 500) & (df['strike'] <= spot + 500)].head(10)
+    
+    # Also test direct quote API with tradingsymbol format
+    test_symbols = [f"NFO:{row['tradingsymbol']}" for _, row in sample.head(3).iterrows()]
+    try:
+        direct_quotes = kite._kite.quote(test_symbols) if hasattr(kite, '_kite') else {}
+    except Exception as e:
+        direct_quotes = {"error": str(e)}
+    
+    return {
+        "symbol": symbol.upper(),
+        "expiry": expiry,
+        "total_options": len(df),
+        "sample_options": [
+            {
+                "strike": row['strike'],
+                "type": row['instrument_type'],
+                "ltp": row.get('ltp', 0),
+                "bid": row.get('bid', 0),
+                "ask": row.get('ask', 0),
+                "oi": row.get('oi', 0),
+                "tradingsymbol": row.get('tradingsymbol', ''),
+                "instrument_token": row.get('instrument_token', 0)
+            }
+            for _, row in sample.iterrows()
+        ],
+        "direct_quote_test": {
+            "symbols_tested": test_symbols,
+            "result": direct_quotes
+        }
+    }
+
+
+@router.get("/debug/expiries/{symbol}")
+async def get_symbol_expiries(symbol: str):
+    """Debug endpoint to check available expiries for a symbol."""
+    global _orchestrator
+    from datetime import date
+    
+    # Use orchestrator's kite client if available
+    if _orchestrator and _orchestrator.kite:
+        kite = _orchestrator.kite
+    else:
+        from ..core.kite_provider import get_kite_client
+        kite = get_kite_client(paper_mode=True)
+        if not kite:
+            raise HTTPException(status_code=500, detail="No valid KiteClient available")
+    
+    df = kite.get_instruments("NFO")
+    if df.empty:
+        return {"error": "Empty instruments list", "expiries": []}
+    
+    options = df[(df['name'] == symbol.upper()) & (df['instrument_type'].isin(['CE', 'PE']))]
+    if options.empty:
+        return {"error": f"No options found for {symbol}", "expiries": []}
+    
+    expiries = sorted(options['expiry'].unique())
+    today = date.today()
+    
+    result = []
+    for exp in expiries[:15]:
+        exp_date = exp if isinstance(exp, date) else exp.date() if hasattr(exp, 'date') else exp
+        dte = (exp_date - today).days if isinstance(exp_date, date) else "N/A"
+        result.append({
+            "expiry": str(exp),
+            "type": str(type(exp).__name__),
+            "dte": dte
+        })
+    
+    return {
+        "symbol": symbol.upper(),
+        "total_options": len(options),
+        "expiry_column_type": str(type(expiries[0]).__name__) if expiries else "N/A",
+        "expiries": result
     }

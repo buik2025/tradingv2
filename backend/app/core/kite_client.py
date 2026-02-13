@@ -237,18 +237,47 @@ class KiteClient:
         
         # Check if instruments are strings (symbols) or ints (tokens)
         if isinstance(instruments[0], str):
-            # Already in symbol format (e.g., "NSE:NIFTY 50")
+            # Already in symbol format (e.g., "NSE:NIFTY 50", "NFO:NIFTY2631025800CE")
             instrument_keys = instruments
+            is_token_request = False
         else:
-            # Convert tokens to exchange:token format
-            instrument_keys = [f"NSE:{token}" if token < 1000000 else f"NFO:{token}" 
-                             for token in instruments]
-        
-        # Check cache for token-based requests
-        if not isinstance(instruments[0], str) and self._is_cache_valid():
-            cached = {t: self._quote_cache[t] for t in instruments if t in self._quote_cache}
-            if len(cached) == len(instruments):
-                return cached
+            # Token-based request - need to convert to EXCHANGE:TRADINGSYMBOL format
+            # Kite API does NOT accept EXCHANGE:TOKEN format
+            is_token_request = True
+            
+            # Check cache first for token-based requests
+            if self._is_cache_valid():
+                cached = {t: self._quote_cache[t] for t in instruments if t in self._quote_cache}
+                if len(cached) == len(instruments):
+                    return cached
+            
+            # Build token to tradingsymbol mapping from instruments cache
+            instruments_df = self.get_instruments("NFO")
+            nse_df = self.get_instruments("NSE")
+            
+            instrument_keys = []
+            token_to_key = {}
+            for token in instruments:
+                # Look up tradingsymbol from instruments data
+                nfo_match = instruments_df[instruments_df['instrument_token'] == token]
+                if not nfo_match.empty:
+                    ts = nfo_match.iloc[0]['tradingsymbol']
+                    key = f"NFO:{ts}"
+                    instrument_keys.append(key)
+                    token_to_key[token] = key
+                else:
+                    nse_match = nse_df[nse_df['instrument_token'] == token] if not nse_df.empty else None
+                    if nse_match is not None and not nse_match.empty:
+                        ts = nse_match.iloc[0]['tradingsymbol']
+                        key = f"NSE:{ts}"
+                        instrument_keys.append(key)
+                        token_to_key[token] = key
+                    else:
+                        logger.warning(f"Could not find tradingsymbol for token {token}")
+            
+            if not instrument_keys:
+                logger.warning("No valid instrument keys found for quote request")
+                return {}
         
         if self.mock_mode:
             return self._mock_quotes(instruments)
@@ -304,8 +333,10 @@ class KiteClient:
             # Get instruments for the underlying (use cached version to avoid rate limits)
             df = self.get_instruments("NFO")
             if df.empty:
-                logger.warning("Empty instruments list from cache")
+                logger.warning("Empty instruments list from Kite API")
                 return pd.DataFrame()
+            
+            logger.info(f"Fetching option chain for {underlying} expiry {expiry}")
             
             # Filter for options - use .copy() to avoid SettingWithCopyWarning
             df = df[
@@ -314,17 +345,62 @@ class KiteClient:
                 (df['expiry'] == expiry)
             ].copy()
             
+            if df.empty:
+                # Log available expiries for debugging - need to re-fetch full instruments
+                full_df = self.get_instruments("NFO")
+                underlying_opts = full_df[(full_df['name'] == underlying) & (full_df['instrument_type'].isin(['CE', 'PE']))]
+                all_expiries = underlying_opts['expiry'].unique() if not underlying_opts.empty else []
+                logger.warning(f"No options found for {underlying} expiry {expiry}. Available expiries: {sorted(list(all_expiries))[:5]}")
+                return pd.DataFrame()
+            
+            logger.info(f"Found {len(df)} options for {underlying} expiry {expiry}")
+            
             if strike_range:
                 df = df[(df['strike'] >= strike_range[0]) & (df['strike'] <= strike_range[1])].copy()
             
-            # Get quotes for all options
-            tokens = df['instrument_token'].tolist()
-            if tokens:
-                quotes = self.get_quote(tokens)
-                df.loc[:, 'ltp'] = df['instrument_token'].map(lambda t: quotes.get(t, {}).get('last_price', 0))
-                df.loc[:, 'bid'] = df['instrument_token'].map(lambda t: quotes.get(t, {}).get('depth', {}).get('buy', [{}])[0].get('price', 0))
-                df.loc[:, 'ask'] = df['instrument_token'].map(lambda t: quotes.get(t, {}).get('depth', {}).get('sell', [{}])[0].get('price', 0))
-                df.loc[:, 'oi'] = df['instrument_token'].map(lambda t: quotes.get(t, {}).get('oi', 0))
+            # Get quotes for all options using Kite quote API
+            # Use tradingsymbol format (NFO:SYMBOL) as required by Kite API
+            tradingsymbols = df['tradingsymbol'].tolist()
+            if tradingsymbols:
+                logger.debug(f"Fetching quotes for {len(tradingsymbols)} options using tradingsymbols")
+                
+                # Build symbol keys in NFO:TRADINGSYMBOL format
+                symbol_keys = [f"NFO:{ts}" for ts in tradingsymbols]
+                
+                # Kite API has a limit of ~500 instruments per quote call
+                # Batch the requests to avoid rate limiting
+                quotes = {}
+                batch_size = 200
+                for i in range(0, len(symbol_keys), batch_size):
+                    batch = symbol_keys[i:i + batch_size]
+                    batch_quotes = self.get_quote(batch)
+                    quotes.update(batch_quotes)
+                
+                # Build lookup by tradingsymbol
+                def get_quote_data(tradingsymbol):
+                    key = f"NFO:{tradingsymbol}"
+                    return quotes.get(key, {})
+                
+                # Use quotes if available, otherwise fall back to last_price from instruments
+                def get_ltp(row):
+                    quote_data = get_quote_data(row['tradingsymbol'])
+                    quote_price = quote_data.get('last_price', 0)
+                    if quote_price > 0:
+                        return quote_price
+                    # Fallback to last_price from instruments data
+                    return row.get('last_price', 0)
+                
+                df.loc[:, 'ltp'] = df.apply(get_ltp, axis=1)
+                df.loc[:, 'bid'] = df['tradingsymbol'].map(lambda ts: get_quote_data(ts).get('depth', {}).get('buy', [{}])[0].get('price', 0))
+                df.loc[:, 'ask'] = df['tradingsymbol'].map(lambda ts: get_quote_data(ts).get('depth', {}).get('sell', [{}])[0].get('price', 0))
+                df.loc[:, 'oi'] = df['tradingsymbol'].map(lambda ts: get_quote_data(ts).get('oi', 0))
+                
+                # Log quote status
+                non_zero_prices = df[df['ltp'] > 0]
+                if len(non_zero_prices) == 0:
+                    logger.warning(f"All {len(df)} options have zero LTP - API quotes unavailable or market closed")
+                else:
+                    logger.info(f"Got prices for {len(non_zero_prices)}/{len(df)} options")
             
             return df
             
@@ -365,45 +441,52 @@ class KiteClient:
         if self.mock_mode or self.paper_mode:
             order_id = f"PAPER_{datetime.now().strftime('%Y%m%d%H%M%S%f')}_{tradingsymbol}"
             
-            # Get current market price
-            market_price = price or 0
-            if self._kite and not self.mock_mode:
+            # Get current market price - MUST fetch LTP for paper orders
+            market_price = 0
+            token = self._get_token_for_symbol(tradingsymbol, exchange)
+            if token and self._kite and not self.mock_mode:
                 try:
-                    quote = self.get_ltp([self._get_token_for_symbol(tradingsymbol, exchange)])
-                    if quote:
-                        market_price = list(quote.values())[0]
-                except:
-                    pass
+                    quote = self.get_ltp([token])
+                    if quote and token in quote:
+                        market_price = quote[token]
+                        logger.debug(f"Fetched LTP for {tradingsymbol}: {market_price}")
+                except Exception as e:
+                    logger.warning(f"Failed to fetch LTP for {tradingsymbol}: {e}")
+            
+            # Fall back to provided price if LTP fetch failed
+            if market_price == 0 and price:
+                market_price = price
+                logger.debug(f"Using provided price for {tradingsymbol}: {market_price}")
             
             # Determine fill behavior based on order type
+            # For paper trading: if we can't get LTP, use provided price and fill immediately
+            # This ensures paper trading works even when API token is expired
+            use_price = market_price if market_price > 0 else (price if price and price > 0 else 0)
+            
             if order_type == "MARKET":
                 # Market orders fill immediately at market price
-                fill_price = market_price or price or 0
+                fill_price = use_price
                 status = "COMPLETE"
                 filled_quantity = quantity
                 pending_quantity = 0
+                if fill_price == 0:
+                    logger.warning(f"[PAPER] MARKET order filled at price 0 - no LTP available for {tradingsymbol}")
             elif order_type == "LIMIT":
-                # Limit orders: check if price is favorable for immediate fill
-                # BUY limit fills if market <= limit price
-                # SELL limit fills if market >= limit price
-                can_fill = False
-                if market_price and price:
-                    if transaction_type == "BUY" and market_price <= price:
-                        can_fill = True
-                    elif transaction_type == "SELL" and market_price >= price:
-                        can_fill = True
-                
-                if can_fill:
-                    fill_price = price  # Fill at limit price
+                # For paper trading: if price is provided, fill immediately at that price
+                # This simulates instant fill for paper orders (realistic for liquid options)
+                if use_price > 0:
+                    fill_price = use_price
                     status = "COMPLETE"
                     filled_quantity = quantity
                     pending_quantity = 0
+                    logger.debug(f"[PAPER] LIMIT order filled immediately at {fill_price} for {tradingsymbol}")
                 else:
-                    # Order stays open, waiting for price to reach limit
-                    fill_price = None
-                    status = "OPEN"
-                    filled_quantity = 0
-                    pending_quantity = quantity
+                    # No price available - still fill but log warning
+                    fill_price = 0
+                    status = "COMPLETE"
+                    filled_quantity = quantity
+                    pending_quantity = 0
+                    logger.warning(f"[PAPER] LIMIT order filled at price 0 - no price available for {tradingsymbol}")
             else:
                 # SL, SL-M orders - treat as open for now
                 fill_price = None
@@ -465,8 +548,18 @@ class KiteClient:
     
     def _get_token_for_symbol(self, tradingsymbol: str, exchange: str) -> int:
         """Get instrument token for a trading symbol."""
-        # This is a simplified lookup - in production, maintain a symbol->token map
-        return 0
+        try:
+            df = self.get_instruments(exchange)
+            if df.empty:
+                return 0
+            
+            match = df[df['tradingsymbol'] == tradingsymbol]
+            if not match.empty:
+                return int(match['instrument_token'].iloc[0])
+            return 0
+        except Exception as e:
+            logger.warning(f"Failed to get token for {tradingsymbol}: {e}")
+            return 0
     
     def modify_order(
         self,
@@ -822,6 +915,36 @@ class KiteClient:
                 logger.warning(f"Returning stale cached instruments for {exchange}")
                 return self._instruments_cache[exchange]
             return pd.DataFrame()
+    
+    def get_lot_size(self, symbol: str, exchange: str = "NFO") -> int:
+        """
+        Get lot size for a symbol from instruments data.
+        
+        Args:
+            symbol: Underlying symbol (NIFTY, BANKNIFTY, etc.)
+            exchange: Exchange (default NFO)
+            
+        Returns:
+            Lot size for the symbol, or default 50 if not found
+        """
+        try:
+            df = self.get_instruments(exchange)
+            if df.empty:
+                logger.warning(f"No instruments data for {exchange}, using default lot size")
+                return 50
+            
+            # Filter for the symbol
+            symbol_df = df[df['name'] == symbol]
+            if symbol_df.empty:
+                logger.warning(f"Symbol {symbol} not found in instruments, using default lot size")
+                return 50
+            
+            lot_size = int(symbol_df['lot_size'].iloc[0])
+            logger.debug(f"Lot size for {symbol}: {lot_size}")
+            return lot_size
+        except Exception as e:
+            logger.error(f"Failed to get lot size for {symbol}: {e}")
+            return 50
     
     def _is_cache_valid(self) -> bool:
         """Check if quote cache is still valid."""
